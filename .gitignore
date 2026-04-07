@@ -1,0 +1,92 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.seed
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+dist/
+build/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Node / Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+.yarn/
+.turbo/
+.next/
+.nuxt/
+.svelte-kit/
+coverage/
+*.tsbuildinfo
+
+# Vite / frontend artifacts
+vite.svg
+
+# Logs and runtime files
+*.log
+logs/
+tmp/
+temp/
+*.pid
+tasking
+
+# Databases and local data
+*.sqlite
+*.sqlite3
+postgres-data/
+redis-data/
+
+# Docker and containers
+.docker/
+docker-compose.override.yml
+
+# Blockchain local state (regtest/test nodes)
+bitcoin-data/
+lnd-data/
+tapd-data/
+
+# Terraform / IaC
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Test artifacts
+playwright-report/
+test-results/
