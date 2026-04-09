@@ -10,7 +10,7 @@ To ensure proper organization and traceability, strategic documentation will fol
 
 Sample Document Structure:
 
-Wiki: 
+Wiki:
 ```markdown
 # Vision and Mission
 ## Vision
