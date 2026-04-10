@@ -28,4 +28,4 @@ link: [Vision and Mission](strategy/mission-vision.md)
 
 ## logs
 
-- 2026-04-07: Initial creation of the vision and mission document.
+- 2026-04-07: Initial creation of the vision and mission document.
