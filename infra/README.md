@@ -18,9 +18,9 @@ All Python services use the shared settings loader in `services/common/config.py
 
 - Set `ENV_PROFILE` to `local`, `staging`, or `production`.
 - The loader reads, in order (when present):
-	1. `.env`
-	2. `infra/.env`
-	3. `infra/.env.<profile>`
+    1. `.env`
+    2. `infra/.env`
+    3. `infra/.env.<profile>`
 
 ### Secret handling convention
 
