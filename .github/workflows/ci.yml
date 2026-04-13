@@ -173,3 +173,6 @@ jobs:
 
       - name: alembic upgrade head (re-apply to confirm idempotency)
         run: alembic upgrade head
+
+      - name: pytest migration schema assertions
+        run: pytest tests/test_migrations_schema.py

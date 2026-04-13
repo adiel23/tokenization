@@ -119,6 +119,19 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()"), nullable=False),
         sa.Column("confirmed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.CheckConstraint("amount_sat > 0", name="ck_transactions_amount_positive"),
+        sa.CheckConstraint(
+            "direction IN ('in', 'out')",
+            name="ck_transactions_direction_allowed",
+        ),
+        sa.CheckConstraint(
+            "status IN ('pending', 'confirmed', 'failed')",
+            name="ck_transactions_status_allowed",
+        ),
+        sa.CheckConstraint(
+            "type IN ('deposit', 'withdrawal', 'ln_send', 'ln_receive', 'escrow_lock', 'escrow_release', 'fee')",
+            name="ck_transactions_type_allowed",
+        ),
         sa.ForeignKeyConstraint(["wallet_id"], ["wallets.id"], name="fk_transactions_wallet_id_wallets"),
         sa.PrimaryKeyConstraint("id", name="pk_transactions"),
     )

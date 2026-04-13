@@ -29,6 +29,10 @@ users = sa.Table(
     sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
     sa.UniqueConstraint("email", name="uq_users_email"),
     sa.Index("ix_users_role", "role"),
+    sa.CheckConstraint(
+        "role IN ('user', 'seller', 'admin', 'auditor')",
+        name="ck_users_role_allowed",
+    ),
 )
 
 wallets = sa.Table(
@@ -44,6 +48,10 @@ wallets = sa.Table(
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
     sa.ForeignKeyConstraint(["user_id"], ["users.id"], name="fk_wallets_user_id_users"),
     sa.UniqueConstraint("user_id", name="uq_wallets_user_id"),
+    sa.CheckConstraint(
+        "onchain_balance_sat >= 0 AND lightning_balance_sat >= 0",
+        name="ck_wallets_balances_non_negative",
+    ),
 )
 
 nostr_identities = sa.Table(
@@ -77,6 +85,19 @@ transactions = sa.Table(
     sa.Index("ix_transactions_type", "type"),
     sa.Index("ix_transactions_status", "status"),
     sa.Index("ix_transactions_created_at", "created_at"),
+    sa.CheckConstraint("amount_sat > 0", name="ck_transactions_amount_positive"),
+    sa.CheckConstraint(
+        "direction IN ('in', 'out')",
+        name="ck_transactions_direction_allowed",
+    ),
+    sa.CheckConstraint(
+        "status IN ('pending', 'confirmed', 'failed')",
+        name="ck_transactions_status_allowed",
+    ),
+    sa.CheckConstraint(
+        "type IN ('deposit', 'withdrawal', 'ln_send', 'ln_receive', 'escrow_lock', 'escrow_release', 'fee')",
+        name="ck_transactions_type_allowed",
+    ),
 )
 
 assets = sa.Table(
