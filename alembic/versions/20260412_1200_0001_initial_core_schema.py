@@ -32,6 +32,10 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
         sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
+        sa.CheckConstraint(
+            "role IN ('user', 'seller', 'admin', 'auditor')",
+            name="ck_users_role_allowed",
+        ),
         sa.PrimaryKeyConstraint("id", name="pk_users"),
         sa.UniqueConstraint("email", name="uq_users_email"),
     )
@@ -47,6 +51,10 @@ def upgrade() -> None:
         sa.Column("derivation_path", sa.String(length=50), nullable=False, server_default="m/86'/0'/0'"),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
+        sa.CheckConstraint(
+            "onchain_balance_sat >= 0 AND lightning_balance_sat >= 0",
+            name="ck_wallets_balances_non_negative",
+        ),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], name="fk_wallets_user_id_users"),
         sa.PrimaryKeyConstraint("id", name="pk_wallets"),
         sa.UniqueConstraint("user_id", name="uq_wallets_user_id"),
