@@ -41,6 +41,10 @@ def _check_redis_ping(redis_url: str) -> tuple[bool, str | None, str]:
         return False, str(exc), f"{host}:{port}"
 
 
+def get_readiness_payload(settings: Settings) -> dict:
+    postgres_ok, postgres_error = _check_tcp_socket(settings.postgres_host, settings.postgres_port)
+    redis_ok, redis_error, redis_target = _check_redis_ping(settings.redis_url)
+
     bitcoin_ok, bitcoin_error = _check_tcp_socket(settings.bitcoin_rpc_host, settings.bitcoin_rpc_port)
     lnd_ok, lnd_error = _check_tcp_socket(settings.lnd_grpc_host, settings.lnd_grpc_port)
 
