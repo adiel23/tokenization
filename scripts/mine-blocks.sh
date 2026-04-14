@@ -8,6 +8,12 @@ set -euo pipefail
 BLOCKS="${1:-1}"
 CONTAINER="${BTC_CONTAINER:-tokenization-bitcoind}"
 
+# Ensure a wallet is loaded
+if ! docker exec "$CONTAINER" bitcoin-cli -regtest -rpcuser=local_rpc -rpcpassword=local_rpc_password listwallets | grep -q "default"; then
+  echo "No 'default' wallet found, creating one..."
+  docker exec "$CONTAINER" bitcoin-cli -regtest -rpcuser=local_rpc -rpcpassword=local_rpc_password createwallet "default" > /dev/null
+fi
+
 # Create or reuse a mining address
 ADDR=$(docker exec "$CONTAINER" bitcoin-cli -regtest -rpcuser=local_rpc -rpcpassword=local_rpc_password getnewaddress "mine" "bech32")
 docker exec "$CONTAINER" bitcoin-cli -regtest -rpcuser=local_rpc -rpcpassword=local_rpc_password generatetoaddress "$BLOCKS" "$ADDR"

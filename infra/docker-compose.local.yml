@@ -149,12 +149,16 @@ services:
       - platform
 
   bitcoind:
-    image: lncm/bitcoind:v28.1
+    image: lncm/bitcoind:v28.0
     container_name: tokenization-bitcoind
+    user: "0:0"
+    command:
+      - -datadir=/data/.bitcoin
+      - -printtoconsole
     restart: unless-stopped
     volumes:
-      - ./bitcoin/bitcoin.conf:/home/bitcoin/.bitcoin/bitcoin.conf:ro
-      - bitcoin_data:/home/bitcoin/.bitcoin
+      - ./bitcoin/bitcoin.conf:/data/.bitcoin/bitcoin.conf:ro
+      - bitcoin_data:/data/.bitcoin
     ports:
       - "18443:18443"
     healthcheck:
