@@ -78,6 +78,7 @@ def test_target_tables_exist(inspector: sa.Inspector) -> None:
 
     assert {
         "users",
+        "refresh_token_sessions",
         "nostr_identities",
         "wallets",
         "transactions",
@@ -109,6 +110,31 @@ def test_users_schema_matches_spec(inspector: sa.Inspector) -> None:
     assert "uq_users_email" in unique_constraints
     assert "ix_users_role" in indexes
     assert "ck_users_role_allowed" in checks
+
+
+def test_refresh_token_sessions_schema_matches_spec(inspector: sa.Inspector) -> None:
+    columns = _column_map(inspector, "refresh_token_sessions")
+    indexes = _constraint_names(inspector.get_indexes("refresh_token_sessions"))
+    unique_constraints = _constraint_names(inspector.get_unique_constraints("refresh_token_sessions"))
+    foreign_keys = inspector.get_foreign_keys("refresh_token_sessions")
+
+    assert columns["user_id"]["nullable"] is False
+    assert columns["token_jti"]["nullable"] is False
+    assert columns["replaced_by_jti"]["nullable"] is True
+    assert columns["expires_at"]["nullable"] is False
+    assert columns["revoked_at"]["nullable"] is True
+    assert columns["created_at"]["default"] is not None
+    assert columns["updated_at"]["default"] is not None
+
+    assert {"ix_refresh_token_sessions_user_id", "ix_refresh_token_sessions_expires_at"}.issubset(indexes)
+    assert "uq_refresh_token_sessions_token_jti" in unique_constraints
+    _assert_foreign_key(
+        foreign_keys,
+        name="fk_refresh_token_sessions_user_id_users",
+        constrained_columns=["user_id"],
+        referred_table="users",
+        referred_columns=["id"],
+    )
 
 
 def test_nostr_identities_schema_matches_spec(inspector: sa.Inspector) -> None:
