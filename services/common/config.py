@@ -64,6 +64,8 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = None
     openai_api_key_file: str | None = None
+    wallet_encryption_key: str | None = None
+    wallet_encryption_key_file: str | None = None
 
     log_level: str
 
@@ -97,10 +99,13 @@ class Settings(BaseSettings):
         self.bitcoin_rpc_password = self._resolve_secret(self.bitcoin_rpc_password, self.bitcoin_rpc_password_file)
         self.jwt_secret = self._resolve_secret(self.jwt_secret, self.jwt_secret_file)
         self.openai_api_key = self._resolve_secret(self.openai_api_key, self.openai_api_key_file)
+        self.wallet_encryption_key = self._resolve_secret(self.wallet_encryption_key, self.wallet_encryption_key_file)
 
         if self.env_profile in {"staging", "production"}:
             if not self.jwt_secret:
                 raise ValueError("JWT secret is required for staging/production")
+            if not self.wallet_encryption_key:
+                raise ValueError("wallet_encryption_key is required for staging/production")
             if "user:pass@localhost" in self.database_url:
                 raise ValueError("database_url must be overridden for staging/production")
 
