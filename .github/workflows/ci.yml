@@ -18,13 +18,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Basic Secret Scanner
-        run: |
-          if grep -rEiw 'BEGIN .* PRIVATE KEY|SECRET_KEY|PASSWORD|xoxb-|xoxp-' --exclude-dir=.git --exclude-dir=specs --exclude-dir=.github --exclude-dir=infra --exclude-dir=tests --exclude-dir=auth .; then
-            echo "🚨 Secrets detected!"
-            exit 1
-          else
-            echo "✅ No secrets detected."
-          fi
+        run: python scripts/scan_secrets.py
 
       - name: Markdown Lint
         uses: DavidAnson/markdownlint-cli2-action@v15
