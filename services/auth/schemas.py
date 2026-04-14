@@ -43,16 +43,31 @@ class LogoutRequest(BaseModel):
     refresh_token: str = Field(min_length=1)
 
 
+class NostrSignedEvent(BaseModel):
+    id: str = Field(min_length=64, max_length=64)
+    kind: int
+    created_at: int
+    content: str
+    tags: list[list[str]] = []
+    sig: str = Field(min_length=128, max_length=128)
+
+
+class NostrLoginRequest(BaseModel):
+    pubkey: str = Field(min_length=64, max_length=64)
+    signed_event: NostrSignedEvent
+
+
 # ---------------------------------------------------------------------------
 # Response schemas
 # ---------------------------------------------------------------------------
 
 class UserOut(BaseModel):
     id: str
-    email: str
+    email: str | None = None
     display_name: str
     role: str
     created_at: datetime
+
 
 
 class TokensOut(BaseModel):
@@ -74,6 +89,15 @@ class RoleCheckResponse(BaseModel):
     status: Literal["allowed"]
     actor_role: str
     required_roles: list[str]
+
+
+class TwoFactorEnableResponse(BaseModel):
+    totp_uri: str
+    backup_codes: list[str]
+
+
+class TwoFactorVerifyRequest(BaseModel):
+    totp_code: str = Field(min_length=6, max_length=6)
 
 
 # ---------------------------------------------------------------------------

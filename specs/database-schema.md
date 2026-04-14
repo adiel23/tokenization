@@ -115,7 +115,6 @@ production
 developer (local)
 staging (pre produccion)
 
-
 ### 3.4 `transactions`
 
 Immutable ledger of all financial movements.

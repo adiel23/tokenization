@@ -3,33 +3,46 @@ from __future__ import annotations
 import base64
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 import hashlib
 import hmac
+import logging
+import os
 from pathlib import Path
 import secrets
 import sys
 import time
+from types import MethodType
+from typing import Any
 import uuid
 
+import grpc
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Security, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import get_readiness_payload, get_settings
 
+from .auth import get_current_user_id, require_2fa
 from .db import (
     create_onchain_withdrawal,
+    create_transaction,
+    get_db_conn,
+    get_engine,
     get_or_create_wallet,
+    get_token_balances_for_user,
     get_user_by_id,
+    get_wallet_by_user_id,
     list_wallet_transactions,
 )
+from .lnd_client import LNDClient
+from .log_filter import SensitiveDataFilter
 from .schemas import (
     OnchainAddressResponse,
     OnchainWithdrawalRequest,
@@ -38,8 +51,26 @@ from .schemas import (
     TransactionHistoryResponse,
     TransactionType,
 )
+from .schemas_lnd import (
+    Invoice,
+    InvoiceCreate,
+    InvoiceStatus,
+    Payment,
+    PaymentCreate,
+    PaymentStatus,
+)
+from .schemas_wallet import TokenBalance, WalletResponse, WalletSummary
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.addFilter(SensitiveDataFilter())
+
+os.environ.setdefault("TAPD_MACAROON_PATH", "")
+os.environ.setdefault("TAPD_TLS_CERT_PATH", "")
 
 settings = get_settings(service_name="wallet", default_port=8001)
+lnd_client = LNDClient(settings)
 
 _ALGORITHM = "HS256"
 _DEFAULT_TX_VSIZE = 141
@@ -47,7 +78,7 @@ _TOTP_DIGITS = 6
 _TOTP_PERIOD_SECONDS = 30
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 _bearer_scheme = HTTPBearer(auto_error=False)
-_engine: object = None
+_engine: AsyncEngine | Any | None = None
 
 
 @dataclass(frozen=True)
@@ -70,24 +101,64 @@ def _error(code: str, message: str, status_code: int) -> JSONResponse:
     )
 
 
-def _make_async_url(sync_url: str) -> str:
-    url = sync_url
-    for prefix in ("postgresql://", "postgres://"):
-        if url.startswith(prefix):
-            return "postgresql+asyncpg://" + url[len(prefix):]
-    return url
+def _runtime_engine() -> AsyncEngine | Any:
+    global _engine
+    if _engine is None:
+        _engine = get_engine()
+    return _engine
+
+
+def _row_value(row: object, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None and key in mapping:
+        return mapping[key]
+
+    if hasattr(row, key):
+        return getattr(row, key)
+
+    try:
+        return row[key]  # type: ignore[index]
+    except (KeyError, TypeError, IndexError):
+        return default
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    engine = get_engine()
     global _engine
-    async_url = _make_async_url(settings.database_url)
-    _engine = create_async_engine(async_url, pool_pre_ping=True)
+    if _engine is None:
+        _engine = engine
     yield
-    await _engine.dispose()
+    await engine.dispose()
+
+
+@asynccontextmanager
+async def _noop_lifespan(app: FastAPI):
+    yield
 
 
 app = FastAPI(title="Wallet Service", lifespan=_lifespan)
+_original_router_lifespan = app.router.lifespan
+
+
+async def _safe_router_lifespan(self, scope, receive, send):
+    if self.lifespan_context is None:
+        self.lifespan_context = _noop_lifespan
+        try:
+            await _original_router_lifespan(scope, receive, send)
+        finally:
+            self.lifespan_context = None
+        return
+
+    await _original_router_lifespan(scope, receive, send)
+
+
+app.router.lifespan = MethodType(_safe_router_lifespan, app.router)
 
 
 def _jwt_secret() -> str:
@@ -131,10 +202,10 @@ async def _get_current_principal(
     if user_id is None:
         raise _invalid_access_token_error()
 
-    async with _engine.connect() as conn:
+    async with _runtime_engine().connect() as conn:
         row = await get_user_by_id(conn, user_id)
 
-    if row is None or getattr(row, "deleted_at", None) is not None:
+    if row is None or _row_value(row, "deleted_at") is not None:
         raise _invalid_access_token_error()
 
     return AuthenticatedPrincipal(id=user_id)
@@ -191,7 +262,7 @@ def _verify_totp_code(secret: str, code: str, *, now: float | None = None) -> bo
 def _sort_transaction_rows(rows: list[object]) -> list[object]:
     return sorted(
         rows,
-        key=lambda row: (getattr(row, "created_at"), str(getattr(row, "id"))),
+        key=lambda row: (_row_value(row, "created_at"), str(_row_value(row, "id"))),
         reverse=True,
     )
 
@@ -205,7 +276,7 @@ def _build_transaction_page(
 ) -> tuple[list[object], str | None]:
     filtered_rows = [
         row for row in _sort_transaction_rows(rows)
-        if transaction_type is None or getattr(row, "type") == transaction_type
+        if transaction_type is None or _row_value(row, "type") == transaction_type
     ]
 
     start_index = 0
@@ -220,7 +291,7 @@ def _build_transaction_page(
             ) from exc
 
         for index, row in enumerate(filtered_rows):
-            if str(getattr(row, "id")) == cursor_uuid:
+            if str(_row_value(row, "id")) == cursor_uuid:
                 start_index = index + 1
                 break
         else:
@@ -231,22 +302,22 @@ def _build_transaction_page(
             )
 
     page = filtered_rows[start_index:start_index + limit]
-    next_cursor = str(page[-1].id) if start_index + limit < len(filtered_rows) and page else None
+    next_cursor = str(_row_value(page[-1], "id")) if start_index + limit < len(filtered_rows) and page else None
     return page, next_cursor
 
 
 def _transaction_history_item(row: object) -> TransactionHistoryItem:
-    created_at = getattr(row, "created_at")
+    created_at = _row_value(row, "created_at")
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
 
     return TransactionHistoryItem(
-        id=str(getattr(row, "id")),
-        type=getattr(row, "type"),
-        amount_sat=getattr(row, "amount_sat"),
-        direction=getattr(row, "direction"),
-        status=getattr(row, "status"),
-        description=getattr(row, "description"),
+        id=str(_row_value(row, "id")),
+        type=_row_value(row, "type"),
+        amount_sat=_row_value(row, "amount_sat"),
+        direction=_row_value(row, "direction"),
+        status=_row_value(row, "status"),
+        description=_row_value(row, "description"),
         created_at=created_at,
     )
 
@@ -265,13 +336,185 @@ async def contract_exception_handler(request: Request, exc: ContractError):
     return _error(exc.code, exc.message, exc.status_code)
 
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    return _error(
-        code="http_error",
-        message=str(exc.detail),
-        status_code=exc.status_code,
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": settings.service_name,
+        "env_profile": settings.env_profile,
+    }
+
+
+@app.get("/ready")
+async def ready():
+    payload = get_readiness_payload(settings)
+    status_code = 200 if payload["status"] == "ready" else 503
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/wallet", response_model=WalletResponse, tags=["Wallet"])
+async def get_wallet_summary(user_id: str = Depends(get_current_user_id)):
+    async with _runtime_engine().connect() as conn:
+        wallet_row = await get_wallet_by_user_id(conn, user_id)
+        if not wallet_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Wallet not found for user",
+            )
+
+        token_rows = await get_token_balances_for_user(conn, user_id)
+
+    token_balances = [
+        TokenBalance(
+            token_id=row["token_id"],
+            asset_name=row["asset_name"],
+            symbol=None,
+            balance=row["balance"],
+            unit_price_sat=row["unit_price_sat"],
+        )
+        for row in token_rows
+    ]
+
+    onchain = _row_value(wallet_row, "onchain_balance_sat", 0)
+    lightning = _row_value(wallet_row, "lightning_balance_sat", 0)
+    tokens_valuation = sum(t.balance * t.unit_price_sat for t in token_balances)
+
+    return WalletResponse(
+        wallet=WalletSummary(
+            id=_row_value(wallet_row, "id"),
+            onchain_balance_sat=onchain,
+            lightning_balance_sat=lightning,
+            token_balances=token_balances,
+            total_value_sat=onchain + lightning + tokens_valuation,
+        )
     )
+
+
+@app.post("/lightning/invoices", response_model=Invoice, tags=["Lightning"])
+async def create_invoice(
+    req: InvoiceCreate,
+    user_id: str = Depends(get_current_user_id),
+    conn: AsyncConnection = Depends(get_db_conn),
+):
+    try:
+        resp = lnd_client.create_invoice(memo=req.memo or "", amount_sats=req.amount_sats)
+
+        wallet = await get_wallet_by_user_id(conn, user_id)
+        if wallet:
+            await create_transaction(
+                conn,
+                wallet_id=_row_value(wallet, "id"),
+                type="ln_receive",
+                direction="in",
+                amount_sat=req.amount_sats,
+                status="pending",
+                ln_payment_hash=resp.r_hash.hex(),
+                description=req.memo,
+            )
+
+        return Invoice(
+            payment_request=resp.payment_request,
+            payment_hash=resp.r_hash.hex(),
+            r_hash=resp.r_hash.hex(),
+            amount_sats=req.amount_sats,
+            memo=req.memo,
+            status=InvoiceStatus.OPEN,
+            created_at=datetime.now(timezone.utc),
+        )
+    except grpc.RpcError as exc:
+        logger.error("gRPC error creating invoice: %s", exc)
+        raise HTTPException(status_code=503, detail="Lightning service unavailable") from exc
+    except Exception as exc:
+        logger.error("Unexpected error creating invoice: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
+
+
+@app.post("/lightning/payments", response_model=Payment, tags=["Lightning"])
+async def pay_invoice(
+    req: PaymentCreate,
+    user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_2fa),
+    conn: AsyncConnection = Depends(get_db_conn),
+):
+    try:
+        wallet = await get_wallet_by_user_id(conn, user_id)
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        resp = lnd_client.pay_invoice(payment_request=req.payment_request)
+
+        payment_status = PaymentStatus.SUCCEEDED
+        db_status = "confirmed"
+        failure_reason = None
+        if resp.payment_error:
+            payment_status = PaymentStatus.FAILED
+            db_status = "failed"
+            failure_reason = resp.payment_error
+
+        amount_sat = resp.payment_route.total_amt if resp.payment_route else 0
+
+        await create_transaction(
+            conn,
+            wallet_id=_row_value(wallet, "id"),
+            type="ln_send",
+            direction="out",
+            amount_sat=amount_sat,
+            status=db_status,
+            ln_payment_hash=resp.payment_hash.hex(),
+            description=f"Payment to {req.payment_request[:20]}...",
+        )
+
+        return Payment(
+            payment_hash=resp.payment_hash.hex(),
+            payment_preimage=resp.payment_preimage.hex() if not resp.payment_error else None,
+            status=payment_status,
+            fee_sats=resp.payment_route.total_fees if resp.payment_route else 0,
+            failure_reason=failure_reason,
+            created_at=datetime.now(timezone.utc),
+        )
+    except grpc.RpcError as exc:
+        logger.error("gRPC error paying invoice: %s", exc)
+        raise HTTPException(status_code=503, detail="Lightning service unavailable") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error paying invoice: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
+
+
+@app.get("/lightning/invoices/{r_hash}", response_model=Invoice, tags=["Lightning"])
+async def get_invoice(
+    r_hash: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        ln_invoice = lnd_client.lookup_invoice(r_hash_str=r_hash)
+
+        status_map = {
+            0: InvoiceStatus.OPEN,
+            1: InvoiceStatus.SETTLED,
+            2: InvoiceStatus.CANCELED,
+            3: InvoiceStatus.ACCEPTED,
+        }
+
+        return Invoice(
+            payment_request=ln_invoice.payment_request,
+            payment_hash=r_hash,
+            r_hash=r_hash,
+            amount_sats=ln_invoice.value,
+            memo=ln_invoice.memo,
+            status=status_map.get(ln_invoice.state, InvoiceStatus.OPEN),
+            settled_at=datetime.fromtimestamp(ln_invoice.settle_date) if ln_invoice.settle_date else None,
+            created_at=datetime.fromtimestamp(ln_invoice.creation_date),
+        )
+    except grpc.RpcError as exc:
+        if exc.code() == grpc.StatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="Invoice not found") from exc
+        logger.error("gRPC error looking up invoice: %s", exc)
+        raise HTTPException(status_code=503, detail="Lightning service unavailable") from exc
+    except Exception as exc:
+        logger.error("Unexpected error fetching invoice: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
 
 
 @app.post(
@@ -289,7 +532,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
 async def create_onchain_address(
     principal: AuthenticatedPrincipal = Depends(_get_current_principal),
 ):
-    async with _engine.connect() as conn:
+    async with _runtime_engine().connect() as conn:
         await get_or_create_wallet(conn, principal.id)
 
     return OnchainAddressResponse(address=_generate_onchain_address(), type="taproot").model_dump()
@@ -319,17 +562,17 @@ async def withdraw_onchain(
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
-    async with _engine.connect() as conn:  # type: AsyncConnection
+    async with _runtime_engine().connect() as conn:
         user = await get_user_by_id(conn, principal.id)
-        if user is None or getattr(user, "deleted_at", None) is not None:
+        if user is None or _row_value(user, "deleted_at") is not None:
             raise _invalid_access_token_error()
-        if not getattr(user, "totp_secret", None):
+        if not _row_value(user, "totp_secret"):
             raise ContractError(
                 code="two_factor_not_enabled",
                 message="Two-factor authentication must be enabled before withdrawing.",
                 status_code=status.HTTP_403_FORBIDDEN,
             )
-        if not _verify_totp_code(user.totp_secret, two_fa_code):
+        if not _verify_totp_code(_row_value(user, "totp_secret"), two_fa_code):
             raise ContractError(
                 code="invalid_2fa_code",
                 message="Two-factor authentication code is invalid.",
@@ -340,11 +583,11 @@ async def withdraw_onchain(
         fee_sat = _estimate_onchain_fee(body.fee_rate_sat_vb)
         row = await create_onchain_withdrawal(
             conn,
-            wallet_id=str(wallet.id),
+            wallet_id=str(_row_value(wallet, "id")),
             amount_sat=body.amount_sat,
             fee_sat=fee_sat,
             txid=_generate_txid(
-                wallet_id=str(wallet.id),
+                wallet_id=str(_row_value(wallet, "id")),
                 address=body.address,
                 amount_sat=body.amount_sat,
                 fee_sat=fee_sat,
@@ -360,10 +603,10 @@ async def withdraw_onchain(
         )
 
     return OnchainWithdrawalResponse(
-        txid=row.txid,
-        amount_sat=row.amount_sat,
+        txid=_row_value(row, "txid"),
+        amount_sat=_row_value(row, "amount_sat"),
         fee_sat=fee_sat,
-        status=row.status,
+        status=_row_value(row, "status"),
     ).model_dump()
 
 
@@ -385,9 +628,9 @@ async def get_transaction_history(
     transaction_type: TransactionType | None = Query(default=None, alias="type"),
     principal: AuthenticatedPrincipal = Depends(_get_current_principal),
 ):
-    async with _engine.connect() as conn:
+    async with _runtime_engine().connect() as conn:
         wallet = await get_or_create_wallet(conn, principal.id)
-        rows = await list_wallet_transactions(conn, str(wallet.id))
+        rows = await list_wallet_transactions(conn, str(_row_value(wallet, "id")))
 
     page, next_cursor = _build_transaction_page(
         rows,
@@ -400,22 +643,6 @@ async def get_transaction_history(
         transactions=[_transaction_history_item(row) for row in page],
         next_cursor=next_cursor,
     ).model_dump(mode="json")
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "service": settings.service_name,
-        "env_profile": settings.env_profile,
-    }
-
-
-@app.get("/ready")
-async def ready():
-    payload = get_readiness_payload(settings)
-    status_code = 200 if payload["status"] == "ready" else 503
-    return JSONResponse(status_code=status_code, content=payload)
 
 
 if __name__ == "__main__":
