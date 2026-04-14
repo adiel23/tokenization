@@ -60,6 +60,7 @@ def _make_fake_asset(
     owner_id: uuid.UUID,
     *,
     status: str = "pending",
+    category: str = "real_estate",
     ai_score: float | None = None,
     ai_analysis: dict[str, Any] | None = None,
     projected_roi: float | None = None,
@@ -71,7 +72,7 @@ def _make_fake_asset(
         owner_id=owner_id,
         name="Downtown Office Building",
         description="3-story commercial office building in the central district.",
-        category="real_estate",
+        category=category,
         valuation_sat=100_000_000,
         documents_url="https://storage.example.com/docs/abc123",
         status=status,
@@ -357,4 +358,98 @@ class TestGetAssetDetails:
         assert resp.json()["error"] == {
             "code": "asset_not_found",
             "message": "Asset not found.",
+        }
+
+
+class TestListAssets:
+    def test_user_can_list_assets_by_status_and_category(self, client):
+        app_client, settings = client
+        fake_user = _make_fake_user(role="user")
+        access_token = _issue_access_token(fake_user, settings.jwt_secret)
+        approved_art_asset = _make_fake_asset(
+            fake_user.id,
+            status="approved",
+            category="art",
+        )
+        list_assets_mock = AsyncMock(return_value=[approved_art_asset])
+
+        with (
+            patch("services.tokenization.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+            patch("services.tokenization.main.list_assets", list_assets_mock),
+        ):
+            resp = app_client.get(
+                "/assets?status=approved&category=art",
+                headers=_auth_headers(access_token),
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["next_cursor"] is None
+        assert len(body["assets"]) == 1
+        assert body["assets"][0]["id"] == str(approved_art_asset.id)
+        assert body["assets"][0]["status"] == "approved"
+        assert body["assets"][0]["category"] == "art"
+        list_assets_mock.assert_awaited_once()
+        assert list_assets_mock.await_args.kwargs == {
+            "asset_status": "approved",
+            "category": "art",
+        }
+
+    def test_asset_catalog_supports_cursor_pagination(self, client):
+        app_client, settings = client
+        fake_user = _make_fake_user(role="user")
+        access_token = _issue_access_token(fake_user, settings.jwt_secret)
+        newest = _make_fake_asset(fake_user.id, status="tokenized")
+        middle = _make_fake_asset(fake_user.id, status="approved")
+        oldest = _make_fake_asset(fake_user.id, status="pending")
+        newest = newest._replace(created_at=datetime(2026, 4, 10, tzinfo=timezone.utc))
+        middle = middle._replace(created_at=datetime(2026, 4, 9, tzinfo=timezone.utc))
+        oldest = oldest._replace(created_at=datetime(2026, 4, 8, tzinfo=timezone.utc))
+        rows = [oldest, newest, middle]
+
+        with (
+            patch("services.tokenization.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+            patch("services.tokenization.main.list_assets", AsyncMock(return_value=rows)),
+        ):
+            first_page = app_client.get(
+                "/assets?limit=2",
+                headers=_auth_headers(access_token),
+            )
+            second_page = app_client.get(
+                f"/assets?limit=2&cursor={middle.id}",
+                headers=_auth_headers(access_token),
+            )
+
+        assert first_page.status_code == 200
+        first_body = first_page.json()
+        assert [item["id"] for item in first_body["assets"]] == [
+            str(newest.id),
+            str(middle.id),
+        ]
+        assert first_body["next_cursor"] == str(middle.id)
+
+        assert second_page.status_code == 200
+        second_body = second_page.json()
+        assert [item["id"] for item in second_body["assets"]] == [str(oldest.id)]
+        assert second_body["next_cursor"] is None
+
+    def test_asset_catalog_rejects_cursor_outside_filtered_result_set(self, client):
+        app_client, settings = client
+        fake_user = _make_fake_user(role="user")
+        access_token = _issue_access_token(fake_user, settings.jwt_secret)
+        rows = [_make_fake_asset(fake_user.id, status="approved")]
+
+        with (
+            patch("services.tokenization.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+            patch("services.tokenization.main.list_assets", AsyncMock(return_value=rows)),
+        ):
+            resp = app_client.get(
+                f"/assets?status=approved&cursor={uuid.uuid4()}",
+                headers=_auth_headers(access_token),
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"] == {
+            "code": "invalid_cursor",
+            "message": "Cursor does not match an asset in this result set.",
         }

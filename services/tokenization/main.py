@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from fastapi import Depends, FastAPI, Request, Security, status
+from fastapi import Depends, FastAPI, Query, Request, Security, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -21,13 +21,16 @@ from auth.jwt_utils import decode_token
 from google.protobuf.json_format import MessageToDict
 from common import get_readiness_payload, get_settings
 from tokenization.tapd_client import TapdClient
-from tokenization.db import create_asset, get_asset_by_id, get_user_by_id
+from tokenization.db import create_asset, get_asset_by_id, get_user_by_id, list_assets
 from tokenization.schemas import (
+    AssetCategory,
     AssetCreateRequest,
     AssetDetailOut,
     AssetDetailResponse,
+    AssetListResponse,
     AssetOut,
     AssetResponse,
+    AssetStatus,
     AssetTokenOut,
 )
 
@@ -195,6 +198,53 @@ def _asset_detail_out(row: object) -> AssetDetailOut:
     )
 
 
+def _sort_asset_rows(rows: list[object]) -> list[object]:
+    return sorted(
+        rows,
+        key=lambda row: (_aware_datetime(_row_value(row, "created_at")), str(_row_value(row, "id"))),
+        reverse=True,
+    )
+
+
+def _build_asset_page(
+    rows: list[object],
+    *,
+    cursor: str | None,
+    limit: int,
+) -> tuple[list[object], str | None]:
+    ordered_rows = _sort_asset_rows(rows)
+
+    start_index = 0
+    if cursor is not None:
+        try:
+            cursor_uuid = str(uuid.UUID(cursor))
+        except ValueError as exc:
+            raise ContractError(
+                code="invalid_cursor",
+                message="Cursor must be a valid asset UUID.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            ) from exc
+
+        for index, row in enumerate(ordered_rows):
+            if str(_row_value(row, "id")) == cursor_uuid:
+                start_index = index + 1
+                break
+        else:
+            raise ContractError(
+                code="invalid_cursor",
+                message="Cursor does not match an asset in this result set.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+    page = ordered_rows[start_index:start_index + limit]
+    next_cursor = (
+        str(_row_value(page[-1], "id"))
+        if start_index + limit < len(ordered_rows) and page
+        else None
+    )
+    return page, next_cursor
+
+
 def _validation_details(exc: RequestValidationError) -> list[dict[str, str]]:
     details: list[dict[str, str]] = []
     for error in exc.errors():
@@ -344,6 +394,33 @@ async def submit_asset(
 
 
 @app.get(
+    "/assets",
+    status_code=status.HTTP_200_OK,
+    response_model=AssetListResponse,
+    summary="Return a filtered asset catalog",
+)
+async def get_assets(
+    asset_status: AssetStatus | None = Query(default=None, alias="status"),
+    category: AssetCategory | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    _principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _runtime_engine().connect() as conn:
+        rows = await list_assets(
+            conn,
+            asset_status=asset_status,
+            category=category,
+        )
+
+    page, next_cursor = _build_asset_page(rows, cursor=cursor, limit=limit)
+    return AssetListResponse(
+        assets=[_asset_out(row) for row in page],
+        next_cursor=next_cursor,
+    ).model_dump(mode="json")
+
+
+@app.get(
     "/assets/{asset_id}",
     status_code=status.HTTP_200_OK,
     response_model=AssetDetailResponse,
@@ -351,7 +428,7 @@ async def submit_asset(
 )
 async def get_asset(
     asset_id: uuid.UUID,
-    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+    _principal: AuthenticatedPrincipal = Depends(_get_current_principal),
 ):
     async with _runtime_engine().connect() as conn:
         row = await get_asset_by_id(conn, asset_id)

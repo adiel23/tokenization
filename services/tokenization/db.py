@@ -87,3 +87,22 @@ async def get_asset_by_id(
         .where(assets_table.c.id == _as_uuid(asset_id))
     )
     return result.fetchone()
+
+
+async def list_assets(
+    conn: AsyncConnection,
+    *,
+    asset_status: str | None = None,
+    category: str | None = None,
+) -> list[sa.engine.Row]:
+    stmt = sa.select(assets_table)
+
+    if asset_status is not None:
+        stmt = stmt.where(assets_table.c.status == asset_status)
+
+    if category is not None:
+        stmt = stmt.where(assets_table.c.category == category)
+
+    stmt = stmt.order_by(assets_table.c.created_at.desc(), assets_table.c.id.desc())
+    result = await conn.execute(stmt)
+    return result.fetchall()

@@ -65,3 +65,8 @@ class AssetDetailOut(AssetOut):
 
 class AssetDetailResponse(BaseModel):
     asset: AssetDetailOut
+
+
+class AssetListResponse(BaseModel):
+    assets: list[AssetOut]
+    next_cursor: str | None
