@@ -1,7 +1,5 @@
 # Mission and Vision
 
-link: [Mission and Vision](mission-vision.md)
-
 ## Vision
 
 Build the most trustworthy Bitcoin-native tokenization platform for real-world assets, where funding, trading, settlement, and treasury flows are transparent and easy to verify.

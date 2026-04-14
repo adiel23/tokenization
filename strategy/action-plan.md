@@ -1,7 +1,5 @@
 # Action Plan
 
-link: [Action Plan](action-plan.md)
-
 ## Phase 1: Release Readiness
 
 - Complete regtest end-to-end coverage for the marketplace journey.

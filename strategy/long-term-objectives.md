@@ -1,7 +1,5 @@
 # Long-Term Objectives
 
-link: [Long-Term Objectives](long-term-objectives.md)
-
 ## Objectives
 
 1. Deliver end-to-end marketplace reliability from asset submission through settlement.
