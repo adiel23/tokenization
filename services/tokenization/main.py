@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from auth.jwt_utils import decode_token
 from google.protobuf.json_format import MessageToDict
-from common import get_readiness_payload, get_settings
+from common import InternalEventBus, RedisStreamMirror, get_readiness_payload, get_settings
 from tokenization.tapd_client import TapdClient
 from tokenization.tapd_grpc import taprootassets as taproot_rpc
 from tokenization.db import (
@@ -37,7 +37,6 @@ from tokenization.db import (
     reset_asset_evaluation,
 )
 from tokenization.evaluation import evaluate_asset_submission
-from tokenization.events import InternalEventBus, RedisStreamMirror
 from tokenization.schemas import (
     AssetCategory,
     AssetCreateRequest,
@@ -132,11 +131,11 @@ def _normalize_uuid_claim(value: object) -> str | None:
         return None
 
 
-def _row_value(row: object, key: str):
+def _row_value(row: object, key: str, default: Any = None):
     mapping = getattr(row, "_mapping", None)
     if mapping is not None and key in mapping:
         return mapping[key]
-    return getattr(row, key)
+    return getattr(row, key, default)
 
 
 def _optional_row_value(row: object, key: str):
@@ -465,6 +464,21 @@ async def _publish_asset_evaluation_complete(row: object) -> None:
         "completed_at": _isoformat_utc(_row_value(row, "updated_at")),
     }
     await _event_bus.publish("ai.evaluation.complete", payload)
+
+
+async def _publish_token_minted(row: object) -> None:
+    payload = {
+        "event": "token_minted",
+        "asset_id": str(_row_value(row, "id")),
+        "owner_id": str(_row_value(row, "owner_id")),
+        "token_id": str(_row_value(row, "token_id")),
+        "taproot_asset_id": _row_value(row, "taproot_asset_id"),
+        "total_supply": int(_row_value(row, "total_supply", 0)),
+        "circulating_supply": int(_row_value(row, "circulating_supply", 0)),
+        "unit_price_sat": int(_row_value(row, "unit_price_sat", 0)),
+        "minted_at": _isoformat_utc(_row_value(row, "minted_at")),
+    }
+    await _event_bus.publish("token.minted", payload)
 
 
 async def _run_asset_evaluation(
@@ -806,6 +820,11 @@ async def tokenize_asset(
         raise _asset_tokenization_conflict_error(
             "Asset status changed before tokenization could complete. Please retry."
         )
+
+    try:
+        await _publish_token_minted(tokenized_row)
+    except Exception:
+        logger.exception("Token mint event publish failed for asset %s", asset_id)
 
     return AssetDetailResponse(asset=_asset_detail_out(tokenized_row)).model_dump(
         mode="json",
