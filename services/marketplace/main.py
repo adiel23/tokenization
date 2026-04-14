@@ -512,7 +512,7 @@ async def delete_order(
         if _row_value(existing_order, "status") not in {"open", "partially_filled"}:
             raise ContractError(
                 code="order_state_conflict",
-                message="Only open orders can be cancelled.",
+                message="Only open or partially filled orders can be cancelled.",
                 status_code=status.HTTP_409_CONFLICT,
             )
 
