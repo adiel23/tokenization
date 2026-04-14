@@ -17,6 +17,10 @@
 └──────────────┘     └──────────────────┘     └──────────────────┘
        │                                              │
        │              ┌──────────────────┐            │
+       ├─────────────<│ refresh_token_   │            │
+       │              │ sessions         │            │
+       │              └──────────────────┘            │
+       │              ┌──────────────────┐            │
        ├─────────────<│  assets          │            │
        │              └──────────────────┘            │
        │                     │                        │
@@ -106,6 +110,11 @@ One wallet per user. Tracks aggregate balances.
 **Indexes**: `uq_wallets_user_id` (UNIQUE via UniqueConstraint)
 
 ---
+
+production
+developer (local)
+staging (pre produccion)
+
 
 ### 3.4 `transactions`
 
@@ -307,6 +316,25 @@ User enrollments in educational courses.
 | `completed_at`    | `TIMESTAMPTZ`  | nullable                       |                                      |
 
 **Constraints**: UNIQUE(`user_id`, `course_id`)
+
+---
+
+### 3.14 `refresh_token_sessions`
+
+Persists refresh-token JTIs so rotation and revocation can invalidate reused sessions.
+
+| Column            | Type           | Constraints                    | Description                          |
+| :---------------- | :------------- | :----------------------------- | :----------------------------------- |
+| `id`              | `UUID`         | PK                             | Session record identifier            |
+| `user_id`         | `UUID`         | FK → users.id, NOT NULL        | Owning user                          |
+| `token_jti`       | `UUID`         | UNIQUE, NOT NULL               | Current refresh token JTI            |
+| `replaced_by_jti` | `UUID`         | nullable                       | Next refresh token issued on rotation|
+| `expires_at`      | `TIMESTAMPTZ`  | NOT NULL                       | Refresh-token expiry                 |
+| `revoked_at`      | `TIMESTAMPTZ`  | nullable                       | When the session was revoked         |
+| `created_at`      | `TIMESTAMPTZ`  | DEFAULT NOW()                  |                                      |
+| `updated_at`      | `TIMESTAMPTZ`  | DEFAULT NOW()                  |                                      |
+
+**Indexes**: `ix_refresh_token_sessions_user_id`, `ix_refresh_token_sessions_expires_at`, `uq_refresh_token_sessions_token_jti` (UNIQUE via UniqueConstraint)
 
 ---
 

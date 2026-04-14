@@ -35,6 +35,27 @@ users = sa.Table(
     ),
 )
 
+refresh_token_sessions = sa.Table(
+    "refresh_token_sessions",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("token_jti", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("replaced_by_jti", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
+    sa.ForeignKeyConstraint(
+        ["user_id"],
+        ["users.id"],
+        name="fk_refresh_token_sessions_user_id_users",
+    ),
+    sa.UniqueConstraint("token_jti", name="uq_refresh_token_sessions_token_jti"),
+    sa.Index("ix_refresh_token_sessions_user_id", "user_id"),
+    sa.Index("ix_refresh_token_sessions_expires_at", "expires_at"),
+)
+
 wallets = sa.Table(
     "wallets",
     metadata,
