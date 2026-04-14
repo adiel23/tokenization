@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,26 +23,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from auth.jwt_utils import decode_token
 from common import InternalEventBus, RedisStreamMirror, get_readiness_payload, get_settings
+from marketplace.bitcoin_rpc import BitcoinRPCClient, BitcoinRPCError, FundingObservation
 from marketplace.db import (
     cancel_order,
     create_order,
+    create_trade_escrow,
     find_best_match,
+    get_escrow_by_trade_id,
     get_last_trade_price_for_token,
     get_order_by_id,
     get_reserved_buy_commitment,
     get_reserved_sell_quantity,
     get_token_balance_for_user,
     get_token_by_id,
+    get_trade_by_id,
     get_trade_volume_24h,
     get_user_by_id,
     get_wallet_by_user_id,
     list_orders,
     list_trades,
-    settle_trade,
+    mark_escrow_funded,
 )
 from marketplace.schemas import (
     CancelOrderResponse,
     CancelledOrderOut,
+    EscrowOut,
+    EscrowResponse,
     OrderBookLevel,
     OrderBookResponse,
     OrderCreateRequest,
@@ -59,6 +66,17 @@ _engine: AsyncEngine | object | None = None
 logger = logging.getLogger(__name__)
 _event_bus = InternalEventBus()
 _event_bus.subscribe("trade.matched", RedisStreamMirror(settings.redis_url))
+_event_bus.subscribe("escrow.funded", RedisStreamMirror(settings.redis_url))
+_bitcoin_rpc_client = (
+    BitcoinRPCClient(
+        host=settings.bitcoin_rpc_host,
+        port=settings.bitcoin_rpc_port,
+        username=settings.bitcoin_rpc_user,
+        password=settings.bitcoin_rpc_password,
+    )
+    if settings.bitcoin_rpc_password
+    else None
+)
 
 
 class ContractError(Exception):
@@ -161,12 +179,30 @@ def _trade_out(row: object) -> TradeOut:
     )
 
 
+def _escrow_out(row: object) -> EscrowOut:
+    return EscrowOut(
+        id=_row_value(row, "id"),
+        trade_id=_row_value(row, "trade_id"),
+        multisig_address=_row_value(row, "multisig_address"),
+        locked_amount_sat=int(_row_value(row, "locked_amount_sat", 0)),
+        funding_txid=_row_value(row, "funding_txid"),
+        status=_row_value(row, "status"),
+        expires_at=_row_value(row, "expires_at"),
+    )
+
+
 def _remaining_quantity(row: object) -> int:
     return int(_row_value(row, "quantity", 0)) - int(_row_value(row, "filled_quantity", 0))
 
 
 def _wallet_total_balance(row: object) -> int:
     return int(_row_value(row, "onchain_balance_sat", 0)) + int(_row_value(row, "lightning_balance_sat", 0))
+
+
+def _isoformat(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def _build_page(rows: list[object], *, cursor: str | None, limit: int, label: str) -> tuple[list[object], str | None]:
@@ -199,8 +235,13 @@ def _build_page(rows: list[object], *, cursor: str | None, limit: int, label: st
     return page, next_cursor
 
 
-async def _publish_trade_matched(trade_row: object, *, buy_order: object, sell_order: object) -> None:
-    settled_at = _row_value(trade_row, "settled_at")
+async def _publish_trade_matched(
+    trade_row: object,
+    *,
+    escrow_row: object,
+    buy_order: object,
+    sell_order: object,
+) -> None:
     payload = {
         "event": "trade_matched",
         "trade_id": str(_row_value(trade_row, "id")),
@@ -214,9 +255,35 @@ async def _publish_trade_matched(trade_row: object, *, buy_order: object, sell_o
         "total_sat": int(_row_value(trade_row, "total_sat", 0)),
         "fee_sat": int(_row_value(trade_row, "fee_sat", 0)),
         "status": _row_value(trade_row, "status"),
-        "settled_at": settled_at.isoformat().replace("+00:00", "Z") if settled_at else None,
+        "settled_at": _isoformat(_row_value(trade_row, "settled_at")),
+        "escrow_id": str(_row_value(escrow_row, "id")),
+        "multisig_address": _row_value(escrow_row, "multisig_address"),
+        "escrow_status": _row_value(escrow_row, "status"),
+        "escrow_expires_at": _isoformat(_row_value(escrow_row, "expires_at")),
     }
     await _event_bus.publish("trade.matched", payload)
+
+
+async def _publish_escrow_funded(
+    trade_row: object,
+    *,
+    escrow_row: object,
+    buy_order: object,
+    sell_order: object,
+) -> None:
+    payload = {
+        "event": "escrow_funded",
+        "trade_id": str(_row_value(trade_row, "id")),
+        "token_id": str(_row_value(trade_row, "token_id")),
+        "escrow_id": str(_row_value(escrow_row, "id")),
+        "buyer_id": str(_row_value(buy_order, "user_id")),
+        "seller_id": str(_row_value(sell_order, "user_id")),
+        "multisig_address": _row_value(escrow_row, "multisig_address"),
+        "locked_amount_sat": int(_row_value(escrow_row, "locked_amount_sat", 0)),
+        "funding_txid": _row_value(escrow_row, "funding_txid"),
+        "status": _row_value(escrow_row, "status"),
+    }
+    await _event_bus.publish("escrow.funded", payload)
 
 
 def _token_not_found_error() -> ContractError:
@@ -257,6 +324,61 @@ def _invalid_access_token_error() -> ContractError:
         message="Access token is invalid or expired.",
         status_code=status.HTTP_401_UNAUTHORIZED,
     )
+
+
+def _trade_not_found_error() -> ContractError:
+    return ContractError(
+        code="trade_not_found",
+        message="Trade not found.",
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
+
+
+def _escrow_not_found_error() -> ContractError:
+    return ContractError(
+        code="escrow_not_found",
+        message="Escrow not found for this trade.",
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
+
+
+async def _scan_escrow_funding(escrow_row: object) -> FundingObservation | None:
+    if _bitcoin_rpc_client is None:
+        return None
+
+    try:
+        return await asyncio.to_thread(
+            _bitcoin_rpc_client.scan_address,
+            str(_row_value(escrow_row, "multisig_address", "")),
+        )
+    except BitcoinRPCError:
+        logger.exception("Escrow funding check failed for trade %s", _row_value(escrow_row, "trade_id"))
+        return None
+
+
+async def _refresh_escrow_funding(
+    conn: object,
+    *,
+    trade_row: object,
+    escrow_row: object,
+) -> tuple[object, object, bool]:
+    if _row_value(escrow_row, "status") != "created" or _row_value(escrow_row, "funding_txid") is not None:
+        return trade_row, escrow_row, False
+
+    observation = await _scan_escrow_funding(escrow_row)
+    if observation is None:
+        return trade_row, escrow_row, False
+
+    locked_amount_sat = int(_row_value(escrow_row, "locked_amount_sat", 0))
+    if observation.total_amount_sat < locked_amount_sat:
+        return trade_row, escrow_row, False
+
+    updated_trade_row, updated_escrow_row = await mark_escrow_funded(
+        conn,
+        trade_id=_row_value(trade_row, "id"),
+        funding_txid=observation.txid,
+    )
+    return updated_trade_row, updated_escrow_row, True
 
 
 app = FastAPI(title="Marketplace Service", lifespan=_lifespan)
@@ -361,7 +483,7 @@ async def place_order(
             price_sat=body.price_sat,
         )
 
-        published_trades: list[tuple[object, object, object]] = []
+        published_trades: list[tuple[object, object, object, object]] = []
 
         while True:
             current_order = await get_order_by_id(conn, _row_value(order_row, "id"))
@@ -387,7 +509,7 @@ async def place_order(
             sell_order = current_order if body.side == "sell" else matched_order
 
             try:
-                trade_row = await settle_trade(
+                trade_row, escrow_row = await create_trade_escrow(
                     conn,
                     buy_order=buy_order,
                     sell_order=sell_order,
@@ -395,7 +517,7 @@ async def place_order(
                     price_sat=trade_price,
                 )
             except ValueError as exc:
-                if str(exc) in {"insufficient_wallet_balance", "insufficient_token_balance"}:
+                if str(exc) == "insufficient_token_balance":
                     await cancel_order(
                         conn,
                         order_id=_row_value(matched_order, "id"),
@@ -413,12 +535,17 @@ async def place_order(
                     continue
                 raise
 
-            published_trades.append((trade_row, buy_order, sell_order))
+            published_trades.append((trade_row, escrow_row, buy_order, sell_order))
             order_row = await get_order_by_id(conn, _row_value(order_row, "id")) or order_row
 
-    for trade_row, buy_order, sell_order in published_trades:
+    for trade_row, escrow_row, buy_order, sell_order in published_trades:
         try:
-            await _publish_trade_matched(trade_row, buy_order=buy_order, sell_order=sell_order)
+            await _publish_trade_matched(
+                trade_row,
+                escrow_row=escrow_row,
+                buy_order=buy_order,
+                sell_order=sell_order,
+            )
         except Exception:
             logger.exception("Trade event publish failed for trade %s", _row_value(trade_row, "id"))
 
@@ -523,6 +650,56 @@ async def delete_order(
     return CancelOrderResponse(
         order=CancelledOrderOut(id=_row_value(cancelled_order, "id"), status="cancelled"),
     ).model_dump(mode="json")
+
+
+@app.get("/escrows/{trade_id}", response_model=EscrowResponse)
+async def get_escrow_details(
+    trade_id: uuid.UUID,
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _runtime_engine().connect() as conn:
+        trade_row = await get_trade_by_id(conn, trade_id)
+        if trade_row is None:
+            raise _trade_not_found_error()
+
+        buy_order = await get_order_by_id(conn, _row_value(trade_row, "buy_order_id"))
+        sell_order = await get_order_by_id(conn, _row_value(trade_row, "sell_order_id"))
+        if buy_order is None or sell_order is None:
+            raise _trade_not_found_error()
+
+        participant_ids = {
+            str(_row_value(buy_order, "user_id")),
+            str(_row_value(sell_order, "user_id")),
+        }
+        if principal.role != "admin" and principal.id not in participant_ids:
+            raise ContractError(
+                code="forbidden",
+                message="You do not have permission to access this resource.",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        escrow_row = await get_escrow_by_trade_id(conn, trade_id)
+        if escrow_row is None:
+            raise _escrow_not_found_error()
+
+        trade_row, escrow_row, funding_persisted = await _refresh_escrow_funding(
+            conn,
+            trade_row=trade_row,
+            escrow_row=escrow_row,
+        )
+
+    if funding_persisted:
+        try:
+            await _publish_escrow_funded(
+                trade_row,
+                escrow_row=escrow_row,
+                buy_order=buy_order,
+                sell_order=sell_order,
+            )
+        except Exception:
+            logger.exception("Escrow funded event publish failed for trade %s", trade_id)
+
+    return EscrowResponse(escrow=_escrow_out(escrow_row)).model_dump(mode="json")
 
 
 @app.get("/trades", response_model=TradeListResponse)

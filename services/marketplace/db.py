@@ -12,15 +12,21 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common import get_settings
+from common.db.metadata import escrows as escrows_table
+from common.db.metadata import nostr_identities as nostr_identities_table
 from common.db.metadata import orders as orders_table
 from common.db.metadata import token_balances as token_balances_table
 from common.db.metadata import tokens as tokens_table
 from common.db.metadata import trades as trades_table
 from common.db.metadata import users as users_table
 from common.db.metadata import wallets as wallets_table
+from marketplace.escrow import compress_xonly_pubkey, derive_compressed_pubkey, generate_2of3_multisig_address
 
 
 _OPEN_ORDER_STATUSES = ("open", "partially_filled")
+_ESCROW_EXPIRATION = timedelta(hours=24)
+settings = get_settings(service_name="marketplace", default_port=8003)
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:
@@ -57,6 +63,19 @@ async def get_wallet_by_user_id(
 ) -> sa.engine.Row | None:
     result = await conn.execute(
         sa.select(wallets_table).where(wallets_table.c.user_id == _as_uuid(user_id))
+    )
+    return result.fetchone()
+
+
+async def get_nostr_identity_by_user_id(
+    conn: AsyncConnection,
+    user_id: str | uuid.UUID,
+) -> sa.engine.Row | None:
+    result = await conn.execute(
+        sa.select(nostr_identities_table)
+        .where(nostr_identities_table.c.user_id == _as_uuid(user_id))
+        .order_by(nostr_identities_table.c.created_at.asc(), nostr_identities_table.c.id.asc())
+        .limit(1)
     )
     return result.fetchone()
 
@@ -195,6 +214,26 @@ async def list_trades(
     stmt = stmt.order_by(order_column.desc(), trades_table.c.id.desc())
     result = await conn.execute(stmt)
     return result.fetchall()
+
+
+async def get_trade_by_id(
+    conn: AsyncConnection,
+    trade_id: str | uuid.UUID,
+) -> sa.engine.Row | None:
+    result = await conn.execute(
+        sa.select(trades_table).where(trades_table.c.id == _as_uuid(trade_id))
+    )
+    return result.fetchone()
+
+
+async def get_escrow_by_trade_id(
+    conn: AsyncConnection,
+    trade_id: str | uuid.UUID,
+) -> sa.engine.Row | None:
+    result = await conn.execute(
+        sa.select(escrows_table).where(escrows_table.c.trade_id == _as_uuid(trade_id))
+    )
+    return result.fetchone()
 
 
 async def cancel_order(
@@ -398,6 +437,118 @@ async def apply_order_fill(
     )
 
 
+def _platform_escrow_pubkey() -> str:
+    secret = settings.wallet_encryption_key or settings.jwt_secret or settings.service_name
+    return derive_compressed_pubkey(f"platform-escrow:{secret}".encode("utf-8"))
+
+
+async def _resolve_escrow_pubkey(
+    conn: AsyncConnection,
+    user_id: str | uuid.UUID,
+) -> str:
+    nostr_identity = await get_nostr_identity_by_user_id(conn, user_id)
+    if nostr_identity is not None:
+        return compress_xonly_pubkey(str(_row_value(nostr_identity, "pubkey", "")))
+
+    wallet_row = await get_wallet_by_user_id(conn, user_id)
+    if wallet_row is None:
+        raise LookupError("wallet_not_found")
+
+    seed_bytes = bytes(_row_value(wallet_row, "encrypted_seed", b""))
+    if not seed_bytes:
+        raise LookupError("wallet_not_found")
+
+    derivation_path = str(_row_value(wallet_row, "derivation_path", ""))
+    user_uuid = _as_uuid(user_id)
+    seed_material = (
+        b"user-escrow-pubkey:"
+        + user_uuid.bytes
+        + b":"
+        + derivation_path.encode("utf-8")
+        + b":"
+        + seed_bytes
+    )
+    return derive_compressed_pubkey(seed_material)
+
+
+async def create_trade_escrow(
+    conn: AsyncConnection,
+    *,
+    buy_order: object,
+    sell_order: object,
+    quantity: int,
+    price_sat: int,
+    fee_sat: int = 0,
+) -> tuple[sa.engine.Row, sa.engine.Row]:
+    buyer_id = _row_value(buy_order, "user_id")
+    seller_id = _row_value(sell_order, "user_id")
+    token_id = _row_value(buy_order, "token_id")
+    total_sat = quantity * price_sat
+    now = _utc_now()
+
+    buyer_pubkey = await _resolve_escrow_pubkey(conn, buyer_id)
+    seller_pubkey = await _resolve_escrow_pubkey(conn, seller_id)
+    platform_pubkey = _platform_escrow_pubkey()
+    multisig_address = generate_2of3_multisig_address(
+        (buyer_pubkey, seller_pubkey, platform_pubkey),
+        settings.bitcoin_network,
+    )
+
+    try:
+        await decrement_token_balance(conn, user_id=seller_id, token_id=token_id, quantity=quantity)
+        await apply_order_fill(conn, order_row=buy_order, quantity=quantity)
+        await apply_order_fill(conn, order_row=sell_order, quantity=quantity)
+
+        trade_result = await conn.execute(
+            sa.insert(trades_table)
+            .values(
+                id=uuid.uuid4(),
+                buy_order_id=_row_value(buy_order, "id"),
+                sell_order_id=_row_value(sell_order, "id"),
+                token_id=token_id,
+                quantity=quantity,
+                price_sat=price_sat,
+                total_sat=total_sat,
+                fee_sat=fee_sat,
+                status="pending",
+                created_at=now,
+                settled_at=None,
+            )
+            .returning(trades_table)
+        )
+        trade_row = trade_result.fetchone()
+        assert trade_row is not None
+
+        escrow_result = await conn.execute(
+            sa.insert(escrows_table)
+            .values(
+                id=uuid.uuid4(),
+                trade_id=_row_value(trade_row, "id"),
+                multisig_address=multisig_address,
+                buyer_pubkey=buyer_pubkey,
+                seller_pubkey=seller_pubkey,
+                platform_pubkey=platform_pubkey,
+                locked_amount_sat=total_sat,
+                funding_txid=None,
+                release_txid=None,
+                status="created",
+                expires_at=now + _ESCROW_EXPIRATION,
+                created_at=now,
+                updated_at=now,
+            )
+            .returning(escrows_table)
+        )
+        escrow_row = escrow_result.fetchone()
+        assert escrow_row is not None
+
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+    return trade_row, escrow_row
+
+
 async def settle_trade(
     conn: AsyncConnection,
     *,
@@ -445,3 +596,45 @@ async def settle_trade(
     await conn.commit()
     assert trade_row is not None
     return trade_row
+
+
+async def mark_escrow_funded(
+    conn: AsyncConnection,
+    *,
+    trade_id: str | uuid.UUID,
+    funding_txid: str,
+) -> tuple[sa.engine.Row, sa.engine.Row]:
+    now = _utc_now()
+
+    try:
+        escrow_result = await conn.execute(
+            sa.update(escrows_table)
+            .where(escrows_table.c.trade_id == _as_uuid(trade_id))
+            .where(escrows_table.c.status == "created")
+            .values(
+                funding_txid=funding_txid,
+                status="funded",
+                updated_at=now,
+            )
+            .returning(escrows_table)
+        )
+        escrow_row = escrow_result.fetchone()
+        if escrow_row is None:
+            raise LookupError("escrow_not_found")
+
+        trade_result = await conn.execute(
+            sa.update(trades_table)
+            .where(trades_table.c.id == _as_uuid(trade_id))
+            .values(status="escrowed")
+            .returning(trades_table)
+        )
+        trade_row = trade_result.fetchone()
+        if trade_row is None:
+            raise LookupError("trade_not_found")
+
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+    return trade_row, escrow_row

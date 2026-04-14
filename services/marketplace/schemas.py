@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 OrderSide = Literal["buy", "sell"]
 OrderStatus = Literal["open", "partially_filled", "filled", "cancelled"]
 TradeStatus = Literal["pending", "escrowed", "settled", "disputed"]
+EscrowStatus = Literal["created", "funded", "released", "refunded", "disputed"]
 
 
 class OrderCreateRequest(BaseModel):
@@ -76,3 +77,17 @@ class TradeOut(BaseModel):
 class TradeListResponse(BaseModel):
     trades: list[TradeOut]
     next_cursor: UUID | None = None
+
+
+class EscrowOut(BaseModel):
+    id: UUID
+    trade_id: UUID
+    multisig_address: str
+    locked_amount_sat: int
+    funding_txid: str | None = None
+    status: EscrowStatus
+    expires_at: datetime
+
+
+class EscrowResponse(BaseModel):
+    escrow: EscrowOut
