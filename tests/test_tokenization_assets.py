@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import sys
 import uuid
-from collections import namedtuple
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,33 +14,35 @@ from fastapi.testclient import TestClient
 from services.auth.jwt_utils import issue_token_pair
 
 
-FakeUser = namedtuple(
-    "FakeUser",
-    [
-        "id",
-        "email",
-        "display_name",
-        "role",
-        "created_at",
-        "deleted_at",
-    ],
-)
+class FakeUser(NamedTuple):
+    id: uuid.UUID
+    email: str
+    display_name: str
+    role: str
+    created_at: datetime
+    deleted_at: datetime | None
 
-FakeAsset = namedtuple(
-    "FakeAsset",
-    [
-        "id",
-        "owner_id",
-        "name",
-        "description",
-        "category",
-        "valuation_sat",
-        "documents_url",
-        "status",
-        "created_at",
-        "updated_at",
-    ],
-)
+
+class FakeAsset(NamedTuple):
+    id: uuid.UUID
+    owner_id: uuid.UUID
+    name: str
+    description: str
+    category: str
+    valuation_sat: int
+    documents_url: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    ai_score: float | None = None
+    ai_analysis: dict[str, Any] | None = None
+    projected_roi: float | None = None
+    token_id: uuid.UUID | None = None
+    taproot_asset_id: str | None = None
+    total_supply: int | None = None
+    circulating_supply: int | None = None
+    unit_price_sat: int | None = None
+    minted_at: datetime | None = None
 
 
 def _make_fake_user(*, role: str = "seller") -> FakeUser:
@@ -54,7 +56,15 @@ def _make_fake_user(*, role: str = "seller") -> FakeUser:
     )
 
 
-def _make_fake_asset(owner_id: uuid.UUID) -> FakeAsset:
+def _make_fake_asset(
+    owner_id: uuid.UUID,
+    *,
+    status: str = "pending",
+    ai_score: float | None = None,
+    ai_analysis: dict[str, Any] | None = None,
+    projected_roi: float | None = None,
+    tokenized: bool = False,
+) -> FakeAsset:
     now = datetime.now(tz=timezone.utc)
     return FakeAsset(
         id=uuid.uuid4(),
@@ -64,9 +74,18 @@ def _make_fake_asset(owner_id: uuid.UUID) -> FakeAsset:
         category="real_estate",
         valuation_sat=100_000_000,
         documents_url="https://storage.example.com/docs/abc123",
-        status="pending",
+        status=status,
         created_at=now,
         updated_at=now,
+        ai_score=ai_score,
+        ai_analysis=ai_analysis,
+        projected_roi=projected_roi,
+        token_id=uuid.uuid4() if tokenized else None,
+        taproot_asset_id="ab" * 32 if tokenized else None,
+        total_supply=1_000 if tokenized else None,
+        circulating_supply=350 if tokenized else None,
+        unit_price_sat=100_000 if tokenized else None,
+        minted_at=now if tokenized else None,
     )
 
 
@@ -272,3 +291,70 @@ class TestSubmitAsset:
 
         assert resp.status_code == 401
         assert resp.json()["error"]["code"] == "authentication_required"
+
+
+class TestGetAssetDetails:
+    def test_user_can_fetch_asset_details_with_ai_and_token_fields(self, client):
+        app_client, settings = client
+        fake_user = _make_fake_user(role="user")
+        fake_asset = _make_fake_asset(
+            fake_user.id,
+            status="tokenized",
+            ai_score=78.5,
+            ai_analysis={
+                "risk_level": "moderate",
+                "projected_roi_annual": 7.2,
+                "market_timing": "favorable",
+                "summary": "Strong location with consistent occupancy rates.",
+            },
+            projected_roi=7.2,
+            tokenized=True,
+        )
+        access_token = _issue_access_token(fake_user, settings.jwt_secret)
+
+        with (
+            patch("services.tokenization.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+            patch("services.tokenization.main.get_asset_by_id", AsyncMock(return_value=fake_asset)),
+        ):
+            resp = app_client.get(
+                f"/assets/{fake_asset.id}",
+                headers=_auth_headers(access_token),
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()["asset"]
+        assert body["id"] == str(fake_asset.id)
+        assert body["owner_id"] == str(fake_user.id)
+        assert body["status"] == "tokenized"
+        assert body["ai_score"] == 78.5
+        assert body["ai_analysis"] == fake_asset.ai_analysis
+        assert body["projected_roi"] == 7.2
+        assert body["token"] == {
+            "id": str(fake_asset.token_id),
+            "taproot_asset_id": fake_asset.taproot_asset_id,
+            "total_supply": fake_asset.total_supply,
+            "circulating_supply": fake_asset.circulating_supply,
+            "unit_price_sat": fake_asset.unit_price_sat,
+            "minted_at": fake_asset.minted_at.isoformat().replace("+00:00", "Z"),
+        }
+
+    def test_missing_asset_returns_contract_404(self, client):
+        app_client, settings = client
+        fake_user = _make_fake_user(role="user")
+        access_token = _issue_access_token(fake_user, settings.jwt_secret)
+        missing_asset_id = uuid.uuid4()
+
+        with (
+            patch("services.tokenization.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+            patch("services.tokenization.main.get_asset_by_id", AsyncMock(return_value=None)),
+        ):
+            resp = app_client.get(
+                f"/assets/{missing_asset_id}",
+                headers=_auth_headers(access_token),
+            )
+
+        assert resp.status_code == 404
+        assert resp.json()["error"] == {
+            "code": "asset_not_found",
+            "message": "Asset not found.",
+        }

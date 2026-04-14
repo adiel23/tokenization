@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 
@@ -37,7 +37,7 @@ class AssetOut(BaseModel):
     description: str
     category: AssetCategory
     valuation_sat: int
-    documents_url: str
+    documents_url: str | None
     status: AssetStatus
     created_at: datetime
     updated_at: datetime
@@ -46,3 +46,22 @@ class AssetOut(BaseModel):
 class AssetResponse(BaseModel):
     asset: AssetOut
 
+
+class AssetTokenOut(BaseModel):
+    id: str
+    taproot_asset_id: str
+    total_supply: int
+    circulating_supply: int
+    unit_price_sat: int
+    minted_at: datetime
+
+
+class AssetDetailOut(AssetOut):
+    ai_score: float | None = None
+    ai_analysis: dict[str, Any] | None = None
+    projected_roi: float | None = None
+    token: AssetTokenOut | None = None
+
+
+class AssetDetailResponse(BaseModel):
+    asset: AssetDetailOut

@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common.db.metadata import assets as assets_table
+from common.db.metadata import tokens as tokens_table
 from common.db.metadata import users as users_table
 
 
@@ -64,3 +65,25 @@ async def create_asset(
     await conn.commit()
     assert row is not None
     return row
+
+
+async def get_asset_by_id(
+    conn: AsyncConnection,
+    asset_id: str | uuid.UUID,
+) -> sa.engine.Row | None:
+    result = await conn.execute(
+        sa.select(
+            assets_table,
+            tokens_table.c.id.label("token_id"),
+            tokens_table.c.taproot_asset_id,
+            tokens_table.c.total_supply,
+            tokens_table.c.circulating_supply,
+            tokens_table.c.unit_price_sat,
+            tokens_table.c.minted_at,
+        )
+        .select_from(
+            assets_table.outerjoin(tokens_table, tokens_table.c.asset_id == assets_table.c.id)
+        )
+        .where(assets_table.c.id == _as_uuid(asset_id))
+    )
+    return result.fetchone()

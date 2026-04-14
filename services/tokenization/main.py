@@ -21,8 +21,15 @@ from auth.jwt_utils import decode_token
 from google.protobuf.json_format import MessageToDict
 from common import get_readiness_payload, get_settings
 from tokenization.tapd_client import TapdClient
-from tokenization.db import create_asset, get_user_by_id
-from tokenization.schemas import AssetCreateRequest, AssetOut, AssetResponse
+from tokenization.db import create_asset, get_asset_by_id, get_user_by_id
+from tokenization.schemas import (
+    AssetCreateRequest,
+    AssetDetailOut,
+    AssetDetailResponse,
+    AssetOut,
+    AssetResponse,
+    AssetTokenOut,
+)
 
 settings = get_settings(service_name="tokenization", default_port=8002)
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -100,6 +107,13 @@ def _row_value(row: object, key: str):
     return getattr(row, key)
 
 
+def _optional_row_value(row: object, key: str):
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get(key)
+    return getattr(row, key, None)
+
+
 def _jwt_secret() -> str:
     return settings.jwt_secret or "dev-secret-change-me"
 
@@ -112,13 +126,31 @@ def _invalid_access_token_error() -> ContractError:
     )
 
 
+def _asset_not_found_error() -> ContractError:
+    return ContractError(
+        code="asset_not_found",
+        message="Asset not found.",
+        status_code=status.HTTP_404_NOT_FOUND,
+    )
+
+
+def _aware_datetime(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def _asset_out(row: object) -> AssetOut:
-    created_at = _row_value(row, "created_at")
-    updated_at = _row_value(row, "updated_at")
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    created_at = _aware_datetime(_row_value(row, "created_at"))
+    updated_at = _aware_datetime(_row_value(row, "updated_at"))
 
     return AssetOut(
         id=str(_row_value(row, "id")),
@@ -127,10 +159,39 @@ def _asset_out(row: object) -> AssetOut:
         description=_row_value(row, "description"),
         category=_row_value(row, "category"),
         valuation_sat=_row_value(row, "valuation_sat"),
-        documents_url=str(_row_value(row, "documents_url")),
+        documents_url=_optional_row_value(row, "documents_url"),
         status=_row_value(row, "status"),
         created_at=created_at,
         updated_at=updated_at,
+    )
+
+
+def _asset_token_out(row: object) -> AssetTokenOut | None:
+    token_id = _optional_row_value(row, "token_id")
+    if token_id is None:
+        return None
+
+    minted_at = _aware_datetime(_optional_row_value(row, "minted_at"))
+    assert minted_at is not None
+
+    return AssetTokenOut(
+        id=str(token_id),
+        taproot_asset_id=_row_value(row, "taproot_asset_id"),
+        total_supply=_row_value(row, "total_supply"),
+        circulating_supply=_row_value(row, "circulating_supply"),
+        unit_price_sat=_row_value(row, "unit_price_sat"),
+        minted_at=minted_at,
+    )
+
+
+def _asset_detail_out(row: object) -> AssetDetailOut:
+    base_asset = _asset_out(row)
+    return AssetDetailOut(
+        **base_asset.model_dump(),
+        ai_score=_optional_float(_optional_row_value(row, "ai_score")),
+        ai_analysis=_optional_row_value(row, "ai_analysis"),
+        projected_roi=_optional_float(_optional_row_value(row, "projected_roi")),
+        token=_asset_token_out(row),
     )
 
 
@@ -280,6 +341,28 @@ async def submit_asset(
         )
 
     return AssetResponse(asset=_asset_out(row)).model_dump(mode="json")
+
+
+@app.get(
+    "/assets/{asset_id}",
+    status_code=status.HTTP_200_OK,
+    response_model=AssetDetailResponse,
+    summary="Return a single asset with AI and tokenization details",
+)
+async def get_asset(
+    asset_id: uuid.UUID,
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _runtime_engine().connect() as conn:
+        row = await get_asset_by_id(conn, asset_id)
+
+    if row is None:
+        raise _asset_not_found_error()
+
+    return AssetDetailResponse(asset=_asset_detail_out(row)).model_dump(
+        mode="json",
+        exclude_none=True,
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host=settings.service_host, port=settings.service_port)
