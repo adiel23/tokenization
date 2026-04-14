@@ -51,6 +51,35 @@ docker compose -f infra/docker-compose.local.yml down -v
 - Wallet via gateway: `GET http://localhost:8000/v1/wallet/health`
 - PostgreSQL readiness: container healthcheck with `pg_isready`
 - Redis readiness: container healthcheck with `redis-cli ping`
+- Bitcoin Core readiness: container healthcheck with `bitcoin-cli getblockchaininfo`
+
+## Bitcoin Core (regtest)
+
+The local stack includes a pre-configured Bitcoin Core node running in `regtest` mode.
+
+- **RPC Endpoint**: `localhost:18443`
+- **Default RPC User**: `local_rpc`
+- **Default RPC Password**: `local_rpc_password`
+
+### Mining Blocks
+
+Since it is a regtest environment, you need to manually mine blocks to confirm transactions. A helper script is provided:
+
+```bash
+# Mine 1 block (default)
+bash scripts/mine-blocks.sh
+
+# Mine 10 blocks
+bash scripts/mine-blocks.sh 10
+```
+
+### Manual CLI access
+
+You can interact with the node via `bitcoin-cli` through Docker:
+
+```bash
+docker exec tokenization-bitcoind bitcoin-cli -regtest -rpcuser=local_rpc -rpcpassword=local_rpc_password <command>
+```
 
 ## Shared Python Configuration
 
