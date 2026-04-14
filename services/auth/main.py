@@ -37,6 +37,7 @@ from .schemas import (
     LoginRequest,
     LogoutRequest,
     MessageResponse,
+    NostrLoginRequest,
     RefreshRequest,
     RegisterRequest,
     RoleCheckResponse,
@@ -44,9 +45,13 @@ from .schemas import (
     UserOut,
 )
 from .jwt_utils import decode_token, issue_token_pair
+from .nostr_utils import validate_nostr_event, NostrValidationError
 from .db import (
+    create_nostr_identity,
+    create_nostr_user,
     create_refresh_session,
     create_user,
+    get_nostr_identity_by_pubkey,
     get_user_by_email,
     get_user_by_id,
     revoke_refresh_session,
@@ -364,6 +369,54 @@ async def login(body: LoginRequest):
     async with _engine.connect() as conn:  # type: AsyncConnection
         return await _issue_auth_response(
             row,
+            conn=conn,
+            status_code=status.HTTP_200_OK,
+        )
+
+
+@app.post(
+    "/auth/nostr",
+    status_code=status.HTTP_200_OK,
+    response_model=AuthResponse,
+    summary="Log in or register with a Nostr identity",
+)
+async def nostr_login(body: NostrLoginRequest):
+    """Authenticate via Nostr signature challenge."""
+    try:
+        validate_nostr_event(body.pubkey, body.signed_event)
+    except NostrValidationError as e:
+        return _error(
+            "invalid_credentials",
+            str(e),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    async with _engine.connect() as conn:  # type: AsyncConnection
+        identity_row = await get_nostr_identity_by_pubkey(conn, body.pubkey)
+        
+        if identity_row is not None:
+            user_row = await get_user_by_id(conn, str(identity_row.user_id))
+            if user_row is None:
+                return _error(
+                    "invalid_credentials",
+                    "Linked user account not found.",
+                    status.HTTP_401_UNAUTHORIZED,
+                )
+        else:
+            display_name = f"nostr:{body.pubkey[:8]}"
+            user_row = await create_nostr_user(
+                conn,
+                display_name=display_name,
+            )
+            await create_nostr_identity(
+                conn,
+                user_id=str(user_row.id),
+                pubkey=body.pubkey,
+                relay_urls=None,
+            )
+
+        return await _issue_auth_response(
+            user_row,
             conn=conn,
             status_code=status.HTTP_200_OK,
         )
