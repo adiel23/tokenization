@@ -194,7 +194,8 @@ def _build_page(rows: list[object], *, cursor: str | None, limit: int, label: st
             )
 
     page = rows[start_index : start_index + limit]
-    next_cursor = str(_row_value(page[-1], "id")) if len(page) == limit else None
+    has_more = start_index + len(page) < len(rows)
+    next_cursor = str(_row_value(page[-1], "id")) if page and has_more else None
     return page, next_cursor
 
 

@@ -88,8 +88,11 @@ def _make_trade(
     sell_order_id: uuid.UUID,
     quantity: int,
     price_sat: int,
+    status: str = "settled",
+    created_at: datetime | None = None,
+    settled_at: datetime | None = None,
 ) -> dict[str, Any]:
-    now = datetime.now(tz=timezone.utc)
+    now = created_at or datetime.now(tz=timezone.utc)
     return {
         "id": uuid.uuid4(),
         "buy_order_id": buy_order_id,
@@ -99,9 +102,9 @@ def _make_trade(
         "price_sat": price_sat,
         "total_sat": quantity * price_sat,
         "fee_sat": 0,
-        "status": "settled",
+        "status": status,
         "created_at": now,
-        "settled_at": now,
+        "settled_at": settled_at if settled_at is not None else now,
     }
 
 
@@ -461,3 +464,221 @@ def test_cancel_order_allows_owner_to_cancel_partially_filled_order(client):
         order_id=existing_order["id"],
         user_id=str(fake_user.id),
     )
+
+
+def test_get_order_book_returns_aggregated_market_depth_and_stats(client):
+    app_client, _, settings = client
+    fake_user = _make_fake_user(role="user")
+    access_token = _issue_access_token(fake_user, settings.jwt_secret)
+    token_id = uuid.uuid4()
+
+    orders = [
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="buy",
+            quantity=10,
+            price_sat=100_000,
+            filled_quantity=2,
+            status="open",
+        ),
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="buy",
+            quantity=6,
+            price_sat=100_000,
+            filled_quantity=1,
+            status="partially_filled",
+        ),
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="buy",
+            quantity=12,
+            price_sat=99_500,
+            status="open",
+        ),
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="sell",
+            quantity=4,
+            price_sat=101_000,
+            status="open",
+        ),
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="sell",
+            quantity=9,
+            price_sat=101_000,
+            filled_quantity=3,
+            status="partially_filled",
+        ),
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="sell",
+            quantity=7,
+            price_sat=102_000,
+            status="open",
+        ),
+        _make_order(
+            user_id=uuid.uuid4(),
+            token_id=token_id,
+            side="buy",
+            quantity=20,
+            price_sat=98_000,
+            status="filled",
+        ),
+    ]
+
+    with (
+        patch("services.marketplace.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+        patch("services.marketplace.main.get_token_by_id", AsyncMock(return_value={"id": token_id})),
+        patch("services.marketplace.main.list_orders", AsyncMock(return_value=orders)),
+        patch("services.marketplace.main.get_last_trade_price_for_token", AsyncMock(return_value=100_500)),
+        patch("services.marketplace.main.get_trade_volume_24h", AsyncMock(return_value=21)),
+    ):
+        response = app_client.get(
+            f"/orderbook/{token_id}",
+            headers=_auth_headers(access_token),
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "token_id": str(token_id),
+        "bids": [
+            {"price_sat": 100_000, "total_quantity": 13},
+            {"price_sat": 99_500, "total_quantity": 12},
+        ],
+        "asks": [
+            {"price_sat": 101_000, "total_quantity": 10},
+            {"price_sat": 102_000, "total_quantity": 7},
+        ],
+        "last_trade_price_sat": 100_500,
+        "volume_24h": 21,
+    }
+
+
+def test_get_trade_history_paginates_and_filters_by_token(client):
+    app_client, _, settings = client
+    fake_user = _make_fake_user(role="user")
+    access_token = _issue_access_token(fake_user, settings.jwt_secret)
+    token_id = uuid.uuid4()
+    other_token_id = uuid.uuid4()
+    base_time = datetime(2026, 4, 14, 15, 0, tzinfo=timezone.utc)
+
+    filtered_trades = [
+        _make_trade(
+            token_id=token_id,
+            buy_order_id=uuid.uuid4(),
+            sell_order_id=uuid.uuid4(),
+            quantity=3,
+            price_sat=101_000,
+            created_at=base_time,
+            settled_at=base_time,
+        ),
+        _make_trade(
+            token_id=token_id,
+            buy_order_id=uuid.uuid4(),
+            sell_order_id=uuid.uuid4(),
+            quantity=2,
+            price_sat=100_500,
+            created_at=base_time.replace(minute=30),
+            settled_at=base_time.replace(minute=30),
+        ),
+        _make_trade(
+            token_id=token_id,
+            buy_order_id=uuid.uuid4(),
+            sell_order_id=uuid.uuid4(),
+            quantity=1,
+            price_sat=100_000,
+            created_at=base_time.replace(hour=14),
+            settled_at=base_time.replace(hour=14),
+        ),
+    ]
+
+    list_trades_mock = AsyncMock(return_value=filtered_trades)
+
+    with (
+        patch("services.marketplace.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+        patch("services.marketplace.main.get_token_by_id", AsyncMock(return_value={"id": token_id})),
+        patch("services.marketplace.main.list_trades", list_trades_mock),
+    ):
+        first_response = app_client.get(
+            f"/trades?token_id={token_id}&limit=2",
+            headers=_auth_headers(access_token),
+        )
+        second_response = app_client.get(
+            f"/trades?token_id={token_id}&cursor={filtered_trades[1]['id']}&limit=2",
+            headers=_auth_headers(access_token),
+        )
+
+    assert first_response.status_code == 200
+    assert first_response.json() == {
+        "trades": [
+            {
+                "id": str(filtered_trades[0]["id"]),
+                "token_id": str(token_id),
+                "quantity": 3,
+                "price_sat": 101_000,
+                "total_sat": 303_000,
+                "fee_sat": 0,
+                "status": "settled",
+                "created_at": filtered_trades[0]["created_at"].isoformat().replace("+00:00", "Z"),
+                "settled_at": filtered_trades[0]["settled_at"].isoformat().replace("+00:00", "Z"),
+            },
+            {
+                "id": str(filtered_trades[1]["id"]),
+                "token_id": str(token_id),
+                "quantity": 2,
+                "price_sat": 100_500,
+                "total_sat": 201_000,
+                "fee_sat": 0,
+                "status": "settled",
+                "created_at": filtered_trades[1]["created_at"].isoformat().replace("+00:00", "Z"),
+                "settled_at": filtered_trades[1]["settled_at"].isoformat().replace("+00:00", "Z"),
+            },
+        ],
+        "next_cursor": str(filtered_trades[1]["id"]),
+    }
+
+    assert second_response.status_code == 200
+    assert second_response.json() == {
+        "trades": [
+            {
+                "id": str(filtered_trades[2]["id"]),
+                "token_id": str(token_id),
+                "quantity": 1,
+                "price_sat": 100_000,
+                "total_sat": 100_000,
+                "fee_sat": 0,
+                "status": "settled",
+                "created_at": filtered_trades[2]["created_at"].isoformat().replace("+00:00", "Z"),
+                "settled_at": filtered_trades[2]["settled_at"].isoformat().replace("+00:00", "Z"),
+            }
+        ],
+        "next_cursor": None,
+    }
+
+    assert list_trades_mock.await_count == 2
+    list_trades_mock.assert_any_await(ANY, token_id=token_id)
+
+    for response in (first_response, second_response):
+        payload = response.json()
+        assert set(payload.keys()) == {"trades", "next_cursor"}
+        for trade in payload["trades"]:
+            assert set(trade.keys()) == {
+                "id",
+                "token_id",
+                "quantity",
+                "price_sat",
+                "total_sat",
+                "fee_sat",
+                "status",
+                "created_at",
+                "settled_at",
+            }
+            assert trade["token_id"] != str(other_token_id)
