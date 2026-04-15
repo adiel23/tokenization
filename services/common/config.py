@@ -67,8 +67,14 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = None
     openai_api_key_file: str | None = None
+    custody_backend: Literal["software", "hsm"] = "software"
     wallet_encryption_key: str | None = None
     wallet_encryption_key_file: str | None = None
+    custody_hsm_key_label: str | None = None
+    custody_hsm_wrapping_key: str | None = None
+    custody_hsm_wrapping_key_file: str | None = None
+    custody_hsm_signing_key: str | None = None
+    custody_hsm_signing_key_file: str | None = None
     alert_webhook_url: str | None = None
     alert_webhook_url_file: str | None = None
 
@@ -112,14 +118,32 @@ class Settings(BaseSettings):
         self.jwt_secret = self._resolve_secret(self.jwt_secret, self.jwt_secret_file)
         self.openai_api_key = self._resolve_secret(self.openai_api_key, self.openai_api_key_file)
         self.wallet_encryption_key = self._resolve_secret(self.wallet_encryption_key, self.wallet_encryption_key_file)
+        self.custody_hsm_wrapping_key = self._resolve_secret(
+            self.custody_hsm_wrapping_key,
+            self.custody_hsm_wrapping_key_file,
+        )
+        self.custody_hsm_signing_key = self._resolve_secret(
+            self.custody_hsm_signing_key,
+            self.custody_hsm_signing_key_file,
+        )
         self.nostr_private_key = self._resolve_secret(self.nostr_private_key, self.nostr_private_key_file)
         self.alert_webhook_url = self._resolve_secret(self.alert_webhook_url, self.alert_webhook_url_file)
 
         if self.env_profile in {"staging", "beta", "production"}:
             if not self.jwt_secret:
                 raise ValueError("JWT secret is required for staging/beta/production")
-            if not self.wallet_encryption_key:
-                raise ValueError("wallet_encryption_key is required for staging/beta/production")
+            if self.custody_backend == "software":
+                if not self.wallet_encryption_key:
+                    raise ValueError("wallet_encryption_key is required for software custody in staging/beta/production")
+                if not self.wallet_encryption_key_file:
+                    raise ValueError("wallet_encryption_key_file is required for software custody in staging/beta/production")
+            else:
+                if not self.custody_hsm_key_label:
+                    raise ValueError("custody_hsm_key_label is required for HSM custody in staging/beta/production")
+                if not self.custody_hsm_wrapping_key or not self.custody_hsm_signing_key:
+                    raise ValueError("HSM custody requires wrapping and signing keys in staging/beta/production")
+                if not self.custody_hsm_wrapping_key_file or not self.custody_hsm_signing_key_file:
+                    raise ValueError("HSM custody requires file-backed wrapping and signing keys in staging/beta/production")
             if "user:pass@localhost" in self.database_url:
                 raise ValueError("database_url must be overridden for staging/beta/production")
 

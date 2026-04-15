@@ -817,3 +817,33 @@ class TestTwoFactor:
 
         assert resp.status_code == 400
         assert resp.json()["error"]["code"] == "2fa_not_enabled"
+
+
+class TestOnboardingSummary:
+    def test_onboarding_summary_surfaces_custody_and_fiat_readiness(self, client):
+        app_client, fake_conn, settings = client
+        fake_user = _make_fake_user("alice@example.com", "password")
+        kyc_row = MagicMock()
+        kyc_row._mapping = {"status": "verified"}
+
+        with (
+            patch("services.auth.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+            patch("services.auth.main.get_kyc_status", AsyncMock(return_value=kyc_row)),
+        ):
+            token_pair = issue_token_pair(
+                user_id=str(fake_user.id),
+                role=fake_user.role,
+                wallet_id=None,
+                secret=settings.jwt_secret,
+            )
+            headers = {"Authorization": f"Bearer {token_pair.access_token}"}
+
+            resp = app_client.get("/auth/onboarding/summary", headers=headers)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kyc_status"] == "verified"
+        assert body["custody"]["configured_backend"] == "software"
+        assert len(body["fiat_onramp_providers"]) == 2
+        assert any(provider["provider_id"] == "bank-bridge" for provider in body["fiat_onramp_providers"])
+        assert any("provider-hosted checkout" in notice.lower() for notice in body["compliance_notices"])

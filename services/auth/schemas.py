@@ -150,3 +150,34 @@ class KycStatusResponse(BaseModel):
 class KycListResponse(BaseModel):
     records: list[KycStatusOut]
 
+
+class OnboardingCustodyOut(BaseModel):
+    configured_backend: Literal["software", "hsm"]
+    signer_backend: Literal["software", "hsm"]
+    state: Literal["ready", "degraded"]
+    key_reference: str | None = None
+    signer_key_reference: str | None = None
+    seed_exportable: bool
+    server_compromise_impact: str
+    disclaimers: list[str]
+
+
+class OnboardingFiatProviderOut(BaseModel):
+    provider_id: str
+    display_name: str
+    state: Literal["ready", "pending_redirect", "kyc_required", "limited", "unavailable"]
+    supported_fiat_currencies: list[str]
+    supported_countries: list[str]
+    payment_methods: list[str]
+    requires_kyc: bool
+    disclaimer: str
+    external_handoff_url: str
+
+
+class OnboardingSummaryResponse(BaseModel):
+    user: UserOut
+    kyc_status: str
+    custody: OnboardingCustodyOut
+    fiat_onramp_providers: list[OnboardingFiatProviderOut]
+    compliance_notices: list[str]
+

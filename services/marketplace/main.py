@@ -6,8 +6,6 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
-import hmac
 import logging
 from pathlib import Path
 import sys
@@ -37,6 +35,7 @@ from common import (
     get_settings,
     install_http_security,
     record_audit_event,
+    build_platform_signer,
 )
 from common.logging import configure_structured_logging
 from common.metrics import metrics, mount_metrics_endpoint, record_business_event
@@ -529,9 +528,9 @@ def _validate_hex_signature(value: str) -> None:
 
 def _derive_platform_release_signature(escrow_id: uuid.UUID, trade_id: uuid.UUID) -> str:
     """Derive a deterministic platform counter-signature for escrow release."""
-    secret = (settings.wallet_encryption_key or settings.jwt_secret or settings.service_name).encode()
     msg = f"escrow-release:{escrow_id}:{trade_id}".encode()
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+    signer = build_platform_signer(settings)
+    return signer.sign(purpose="escrow-release", message=msg)
 
 
 async def _publish_escrow_released(

@@ -41,6 +41,7 @@ from jose import JWTError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import get_settings
+from common import default_onramp_notices, describe_custody_settings, list_onramp_provider_views
 from common.security import install_http_security
 from common.readiness import get_readiness_payload
 from common.logging import configure_structured_logging
@@ -65,6 +66,9 @@ from .schemas import (
     TwoFactorEnableResponse,
     TwoFactorVerifyRequest,
     UserOut,
+    OnboardingCustodyOut,
+    OnboardingFiatProviderOut,
+    OnboardingSummaryResponse,
 )
 from .jwt_utils import decode_token, issue_token_pair
 from .nostr_utils import validate_nostr_event, NostrValidationError
@@ -84,6 +88,7 @@ from .db import (
 from .kyc_db import (
     create_kyc_record,
     get_kyc_status,
+    is_kyc_verified,
     list_kyc_records,
     update_kyc_status,
 )
@@ -751,6 +756,65 @@ def _kyc_out(row) -> KycStatusOut:
         notes=_val("notes"),
         created_at=_val("created_at"),
         updated_at=_val("updated_at"),
+    )
+
+
+def _kyc_state_label(row) -> str:
+    if row is None:
+        return "not_started"
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return str(mapping.get("status", "not_started"))
+    return str(getattr(row, "status", "not_started"))
+
+
+@app.get(
+    "/auth/onboarding/summary",
+    status_code=status.HTTP_200_OK,
+    response_model=OnboardingSummaryResponse,
+    summary="Return onboarding custody and fiat handoff requirements",
+)
+async def onboarding_summary(
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _engine.connect() as conn:
+        user_row = await get_user_by_id(conn, principal.id)
+        kyc_row = await get_kyc_status(conn, principal.id)
+
+    if user_row is None:
+        raise _invalid_access_token_error()
+
+    custody = describe_custody_settings(settings)
+    providers = list_onramp_provider_views(kyc_verified=is_kyc_verified(kyc_row))
+    record_business_event("auth_onboarding_summary")
+    return OnboardingSummaryResponse(
+        user=_user_out(user_row),
+        kyc_status=_kyc_state_label(kyc_row),
+        custody=OnboardingCustodyOut(
+            configured_backend=custody.backend,
+            signer_backend=custody.signer_backend,
+            state=custody.state,
+            key_reference=custody.key_reference,
+            signer_key_reference=custody.signer_key_reference,
+            seed_exportable=custody.seed_exportable,
+            server_compromise_impact=custody.server_compromise_impact,
+            disclaimers=list(custody.disclaimers),
+        ),
+        fiat_onramp_providers=[
+            OnboardingFiatProviderOut(
+                provider_id=provider.provider_id,
+                display_name=provider.display_name,
+                state=provider.state,
+                supported_fiat_currencies=list(provider.supported_fiat_currencies),
+                supported_countries=list(provider.supported_countries),
+                payment_methods=list(provider.payment_methods),
+                requires_kyc=provider.requires_kyc,
+                disclaimer=provider.disclaimer,
+                external_handoff_url=provider.external_handoff_url,
+            )
+            for provider in providers
+        ],
+        compliance_notices=default_onramp_notices(),
     )
 
 

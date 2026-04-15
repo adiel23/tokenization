@@ -28,9 +28,18 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import get_readiness_payload, get_settings, install_http_security, record_audit_event
+from common import (
+    OnRampError,
+    create_onramp_session,
+    default_onramp_notices,
+    describe_custody_record,
+    describe_custody_settings,
+    list_onramp_provider_views,
+)
 from common.logging import configure_structured_logging
 from common.metrics import metrics, mount_metrics_endpoint, record_business_event
 from common.alerting import alert_dispatcher, AlertSeverity, configure_alerting
+from auth.kyc_db import get_kyc_status, is_kyc_verified
 
 from .auth import get_current_user_id, require_2fa
 from .db import (
@@ -46,6 +55,11 @@ from .db import (
 )
 from .lnd_client import LNDClient
 from .schemas import (
+    CustodyStatusResponse,
+    FiatOnRampProviderStatus,
+    FiatOnRampProvidersResponse,
+    FiatOnRampSessionRequest,
+    FiatOnRampSessionResponse,
     OnchainAddressResponse,
     OnchainWithdrawalRequest,
     OnchainWithdrawalResponse,
@@ -399,6 +413,144 @@ async def get_wallet_summary(user_id: str = Depends(get_current_user_id)):
             total_value_sat=onchain + lightning + tokens_valuation,
         )
     )
+
+
+@app.get(
+    "/wallet/custody",
+    status_code=status.HTTP_200_OK,
+    response_model=CustodyStatusResponse,
+    summary="Return custody posture for the authenticated wallet",
+)
+async def get_wallet_custody_status(
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _runtime_engine().connect() as conn:
+        wallet = await get_or_create_wallet(conn, principal.id)
+
+    encrypted_seed = bytes(_row_value(wallet, "encrypted_seed", b""))
+    descriptor = describe_custody_record(encrypted_seed)
+    custody = describe_custody_settings(settings)
+    record_business_event("wallet_custody_status")
+    return CustodyStatusResponse(
+        configured_backend=custody.backend,
+        wallet_backend=descriptor.backend,
+        signer_backend=custody.signer_backend,
+        state=custody.state,
+        key_reference=descriptor.key_reference or custody.key_reference,
+        signer_key_reference=custody.signer_key_reference,
+        derivation_path=str(_row_value(wallet, "derivation_path", "")),
+        seed_exportable=descriptor.exportable_seed,
+        withdraw_requires_2fa=True,
+        server_compromise_impact=custody.server_compromise_impact,
+        disclaimers=list(custody.disclaimers),
+    ).model_dump(mode="json")
+
+
+@app.get(
+    "/wallet/fiat/onramp/providers",
+    status_code=status.HTTP_200_OK,
+    response_model=FiatOnRampProvidersResponse,
+    summary="List supported fiat-to-BTC on-ramp providers",
+)
+async def list_fiat_onramp_providers(
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _runtime_engine().connect() as conn:
+        kyc_row = await get_kyc_status(conn, principal.id)
+
+    providers = list_onramp_provider_views(kyc_verified=is_kyc_verified(kyc_row))
+    record_business_event("wallet_fiat_onramp_providers")
+    return FiatOnRampProvidersResponse(
+        providers=[
+            FiatOnRampProviderStatus(
+                provider_id=provider.provider_id,
+                display_name=provider.display_name,
+                state=provider.state,
+                supported_fiat_currencies=list(provider.supported_fiat_currencies),
+                supported_countries=list(provider.supported_countries),
+                payment_methods=list(provider.payment_methods),
+                min_fiat_amount=provider.min_fiat_amount,
+                max_fiat_amount=provider.max_fiat_amount,
+                requires_kyc=provider.requires_kyc,
+                disclaimer=provider.disclaimer,
+                external_handoff_url=provider.external_handoff_url,
+            )
+            for provider in providers
+        ],
+        compliance_notices=default_onramp_notices(),
+    ).model_dump(mode="json")
+
+
+@app.post(
+    "/wallet/fiat/onramp/session",
+    status_code=status.HTTP_201_CREATED,
+    response_model=FiatOnRampSessionResponse,
+    summary="Initiate an external fiat-to-BTC on-ramp handoff",
+)
+async def create_fiat_onramp_session(
+    request: Request,
+    body: FiatOnRampSessionRequest,
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    async with _runtime_engine().connect() as conn:
+        user = await get_user_by_id(conn, principal.id)
+        if user is None or _row_value(user, "deleted_at") is not None:
+            raise _invalid_access_token_error()
+
+        wallet = await get_or_create_wallet(conn, principal.id)
+        kyc_row = await get_kyc_status(conn, principal.id)
+
+        try:
+            session = create_onramp_session(
+                provider_id=body.provider_id,
+                user_id=principal.id,
+                wallet_id=str(_row_value(wallet, "id")),
+                deposit_address=_generate_onchain_address(),
+                fiat_currency=body.fiat_currency,
+                fiat_amount=body.fiat_amount,
+                country_code=body.country_code,
+                return_url=body.return_url,
+                cancel_url=body.cancel_url,
+                kyc_verified=is_kyc_verified(kyc_row),
+                signing_secret=settings.jwt_secret,
+            )
+        except OnRampError as exc:
+            raise ContractError(
+                code=exc.code,
+                message=exc.message,
+                status_code=exc.status_code,
+            ) from exc
+
+        await record_audit_event(
+            conn,
+            settings=settings,
+            request=request,
+            action="wallet.fiat_onramp_session",
+            actor_id=principal.id,
+            actor_role=_row_value(user, "role"),
+            target_type="wallet",
+            target_id=_row_value(wallet, "id"),
+            metadata={
+                "provider_id": body.provider_id,
+                "fiat_currency": body.fiat_currency,
+                "fiat_amount": str(body.fiat_amount),
+                "country_code": body.country_code,
+                "deposit_address_tail": session.deposit_address[-8:],
+            },
+        )
+
+    record_business_event("wallet_fiat_onramp_session")
+    return FiatOnRampSessionResponse(
+        session_id=session.session_id,
+        provider_id=session.provider_id,
+        state=session.state,
+        handoff_url=session.handoff_url,
+        deposit_address=session.deposit_address,
+        destination_wallet_id=session.destination_wallet_id,
+        expires_at=session.expires_at,
+        disclaimer=session.disclaimer,
+        compliance_action=session.compliance_action,
+    ).model_dump(mode="json")
 
 
 @app.post("/lightning/invoices", response_model=Invoice, tags=["Lightning"])

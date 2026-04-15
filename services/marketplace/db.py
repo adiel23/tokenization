@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common import get_settings
+from common.custody import derive_platform_signing_material, derive_wallet_escrow_material
 from common.db.metadata import escrows as escrows_table
 from common.db.metadata import nostr_identities as nostr_identities_table
 from common.db.metadata import orders as orders_table
@@ -560,8 +561,9 @@ async def apply_order_fill(
 
 
 def _platform_escrow_pubkey() -> str:
-    secret = settings.wallet_encryption_key or settings.jwt_secret or settings.service_name
-    return derive_compressed_pubkey(f"platform-escrow:{secret}".encode("utf-8"))
+    return derive_compressed_pubkey(
+        derive_platform_signing_material(settings, purpose="escrow-pubkey")
+    )
 
 
 async def _resolve_escrow_pubkey(
@@ -582,13 +584,10 @@ async def _resolve_escrow_pubkey(
 
     derivation_path = str(_row_value(wallet_row, "derivation_path", ""))
     user_uuid = _as_uuid(user_id)
-    seed_material = (
-        b"user-escrow-pubkey:"
-        + user_uuid.bytes
-        + b":"
-        + derivation_path.encode("utf-8")
-        + b":"
-        + seed_bytes
+    seed_material = derive_wallet_escrow_material(
+        user_id=user_uuid,
+        derivation_path=derivation_path,
+        encrypted_seed=seed_bytes,
     )
     return derive_compressed_pubkey(seed_material)
 
