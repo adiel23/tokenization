@@ -42,10 +42,12 @@ from common.metrics import metrics, mount_metrics_endpoint, record_business_even
 from common.alerting import alert_dispatcher, AlertSeverity, configure_alerting
 from marketplace.bitcoin_rpc import BitcoinRPCClient, BitcoinRPCError, FundingObservation
 from marketplace.db import (
+    activate_triggered_orders,
     cancel_order,
     create_order,
     create_trade_escrow,
     find_best_match,
+    get_reference_price_for_token,
     get_dispute_by_trade_id,
     get_escrow_by_trade_id,
     get_last_trade_price_for_token,
@@ -184,12 +186,18 @@ def _row_value(row: object, key: str, default: Any = None) -> Any:
 
 
 def _order_out(row: object) -> OrderOut:
+    triggered_at = _row_value(row, "triggered_at")
+    order_type = _row_value(row, "order_type", "limit")
     return OrderOut(
         id=_row_value(row, "id"),
         token_id=_row_value(row, "token_id"),
         side=_row_value(row, "side"),
+        order_type=order_type,
         quantity=int(_row_value(row, "quantity", 0)),
         price_sat=int(_row_value(row, "price_sat", 0)),
+        trigger_price_sat=_row_value(row, "trigger_price_sat"),
+        triggered_at=triggered_at,
+        is_triggered=order_type == "limit" or triggered_at is not None,
         filled_quantity=int(_row_value(row, "filled_quantity", 0)),
         status=_row_value(row, "status"),
         created_at=_row_value(row, "created_at"),
@@ -243,6 +251,14 @@ def _remaining_quantity(row: object) -> int:
 
 def _wallet_total_balance(row: object) -> int:
     return int(_row_value(row, "onchain_balance_sat", 0)) + int(_row_value(row, "lightning_balance_sat", 0))
+
+
+def _stop_order_triggered(*, side: str, trigger_price_sat: int, reference_price: int | None) -> bool:
+    if reference_price is None:
+        return False
+    if side == "buy":
+        return reference_price >= trigger_price_sat
+    return reference_price <= trigger_price_sat
 
 
 def _isoformat(value: datetime | None) -> str | None:
@@ -921,22 +937,46 @@ async def place_order(
         trade_total_sat = body.quantity * body.price_sat
         await _enforce_kyc_threshold(conn, principal.id, trade_total_sat)
 
+        triggered_at = None
+        if body.order_type == "stop_limit" and body.trigger_price_sat is not None:
+            reference_price = await get_reference_price_for_token(conn, body.token_id)
+            if _stop_order_triggered(
+                side=body.side,
+                trigger_price_sat=body.trigger_price_sat,
+                reference_price=reference_price,
+            ):
+                triggered_at = datetime.now(tz=timezone.utc)
+
         order_row = await create_order(
             conn,
             user_id=principal.id,
             token_id=body.token_id,
             side=body.side,
+            order_type=body.order_type,
             quantity=body.quantity,
             price_sat=body.price_sat,
+            trigger_price_sat=body.trigger_price_sat,
+            triggered_at=triggered_at,
         )
 
         published_trades: list[tuple[object, object, object, object]] = []
 
-        while True:
+        while triggered_at is not None or body.order_type == "limit":
             current_order = await get_order_by_id(conn, _row_value(order_row, "id"))
             if current_order is None or _remaining_quantity(current_order) <= 0:
                 order_row = current_order or order_row
                 break
+
+            if body.order_type == "stop_limit":
+                latest_reference_price = await get_reference_price_for_token(conn, body.token_id)
+            else:
+                latest_reference_price = None
+            if latest_reference_price is not None:
+                await activate_triggered_orders(
+                    conn,
+                    token_id=body.token_id,
+                    reference_price=latest_reference_price,
+                )
 
             matched_order = await find_best_match(
                 conn,
@@ -986,6 +1026,11 @@ async def place_order(
                 raise
 
             published_trades.append((trade_row, escrow_row, buy_order, sell_order))
+            await activate_triggered_orders(
+                conn,
+                token_id=body.token_id,
+                reference_price=trade_price,
+            )
             order_row = await get_order_by_id(conn, _row_value(order_row, "id")) or order_row
 
         await record_audit_event(
@@ -1000,8 +1045,10 @@ async def place_order(
             metadata={
                 "token_id": str(body.token_id),
                 "side": body.side,
+                "order_type": body.order_type,
                 "quantity": body.quantity,
                 "price_sat": body.price_sat,
+                "trigger_price_sat": body.trigger_price_sat,
                 "matched_trades": len(published_trades),
             },
         )
@@ -1068,6 +1115,9 @@ async def get_order_book(
 
         remaining_quantity = _remaining_quantity(row)
         if remaining_quantity <= 0:
+            continue
+
+        if _row_value(row, "order_type", "limit") == "stop_limit" and _row_value(row, "triggered_at") is None:
             continue
 
         price_sat = int(_row_value(row, "price_sat", 0))

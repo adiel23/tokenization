@@ -62,8 +62,11 @@ def _make_order(
     user_id: uuid.UUID,
     token_id: uuid.UUID,
     side: str,
+    order_type: str = "limit",
     quantity: int,
     price_sat: int,
+    trigger_price_sat: int | None = None,
+    triggered_at: datetime | None = None,
     filled_quantity: int = 0,
     status: str = "open",
 ) -> dict[str, Any]:
@@ -73,8 +76,11 @@ def _make_order(
         "user_id": user_id,
         "token_id": token_id,
         "side": side,
+        "order_type": order_type,
         "quantity": quantity,
         "price_sat": price_sat,
+        "trigger_price_sat": trigger_price_sat,
+        "triggered_at": triggered_at,
         "filled_quantity": filled_quantity,
         "status": status,
         "created_at": now,
@@ -419,11 +425,59 @@ def test_place_buy_order_matches_resting_sell_order_and_emits_trade_event(client
         metadata={
             "token_id": str(token_id),
             "side": "buy",
+            "order_type": "limit",
             "quantity": 10,
             "price_sat": 100_000,
+            "trigger_price_sat": None,
             "matched_trades": 1,
         },
     )
+
+
+def test_place_stop_limit_order_remains_dormant_until_triggered(client):
+    app_client, _, settings = client
+    fake_user = _make_fake_user(role="seller")
+    access_token = _issue_access_token(fake_user, settings.jwt_secret)
+    token_id = uuid.uuid4()
+    dormant_order = _make_order(
+        user_id=fake_user.id,
+        token_id=token_id,
+        side="sell",
+        order_type="stop_limit",
+        quantity=5,
+        price_sat=95_000,
+        trigger_price_sat=90_000,
+        triggered_at=None,
+    )
+
+    with (
+        patch("services.marketplace.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+        patch("services.marketplace.main.get_token_by_id", AsyncMock(return_value={"id": token_id})),
+        patch("services.marketplace.main.get_wallet_by_user_id", AsyncMock(return_value=_make_wallet(fake_user.id, onchain=100_000, lightning=0))),
+        patch("services.marketplace.main.get_token_balance_for_user", AsyncMock(return_value={"balance": 50})),
+        patch("services.marketplace.main.get_reserved_sell_quantity", AsyncMock(return_value=0)),
+        patch("services.marketplace.main.get_reference_price_for_token", AsyncMock(return_value=100_000)),
+        patch("services.marketplace.main.create_order", AsyncMock(return_value=dormant_order)),
+        patch("services.marketplace.main.record_audit_event", AsyncMock()),
+    ):
+        response = app_client.post(
+            "/orders",
+            headers=_auth_headers(access_token),
+            json={
+                "token_id": str(token_id),
+                "side": "sell",
+                "order_type": "stop_limit",
+                "quantity": 5,
+                "price_sat": 95_000,
+                "trigger_price_sat": 90_000,
+            },
+        )
+
+    assert response.status_code == 201
+    body = response.json()["order"]
+    assert body["order_type"] == "stop_limit"
+    assert body["is_triggered"] is False
+    assert body["trigger_price_sat"] == 90_000
 
 
 def test_place_buy_order_partially_matches_multiple_resting_sell_orders_and_emits_events(client):

@@ -171,8 +171,11 @@ async def create_order(
     user_id: str | uuid.UUID,
     token_id: str | uuid.UUID,
     side: str,
+    order_type: str,
     quantity: int,
     price_sat: int,
+    trigger_price_sat: int | None = None,
+    triggered_at: datetime | None = None,
 ) -> sa.engine.Row:
     now = _utc_now()
     result = await conn.execute(
@@ -182,8 +185,11 @@ async def create_order(
             user_id=_as_uuid(user_id),
             token_id=_as_uuid(token_id),
             side=side,
+            order_type=order_type,
             quantity=quantity,
             price_sat=price_sat,
+            trigger_price_sat=trigger_price_sat,
+            triggered_at=triggered_at,
             filled_quantity=0,
             status="open",
             created_at=now,
@@ -386,6 +392,12 @@ async def find_best_match(
     stmt = stmt.where(orders_table.c.status.in_(_OPEN_ORDER_STATUSES))
     stmt = stmt.where(orders_table.c.user_id != _as_uuid(requester_id))
     stmt = stmt.where(orders_table.c.quantity > orders_table.c.filled_quantity)
+    stmt = stmt.where(
+        sa.or_(
+            orders_table.c.order_type == "limit",
+            orders_table.c.triggered_at.is_not(None),
+        )
+    )
 
     if incoming_side == "buy":
         stmt = stmt.where(orders_table.c.side == "sell")
@@ -424,6 +436,65 @@ async def get_last_trade_price_for_token(
     )
     value = result.scalar_one_or_none()
     return None if value is None else int(value)
+
+
+async def get_reference_price_for_token(
+    conn: AsyncConnection,
+    token_id: str | uuid.UUID,
+) -> int | None:
+    result = await conn.execute(
+        sa.select(trades_table.c.price_sat)
+        .where(trades_table.c.token_id == _as_uuid(token_id))
+        .order_by(
+            sa.func.coalesce(trades_table.c.settled_at, trades_table.c.created_at).desc(),
+            trades_table.c.id.desc(),
+        )
+        .limit(1)
+    )
+    price = result.scalar_one_or_none()
+    if price is not None:
+        return int(price)
+
+    token_result = await conn.execute(
+        sa.select(tokens_table.c.unit_price_sat)
+        .where(tokens_table.c.id == _as_uuid(token_id))
+        .limit(1)
+    )
+    token_price = token_result.scalar_one_or_none()
+    return None if token_price is None else int(token_price)
+
+
+async def activate_triggered_orders(
+    conn: AsyncConnection,
+    *,
+    token_id: str | uuid.UUID,
+    reference_price: int,
+) -> list[sa.engine.Row]:
+    now = _utc_now()
+    trigger_condition = sa.or_(
+        sa.and_(
+            orders_table.c.side == "buy",
+            orders_table.c.trigger_price_sat <= reference_price,
+        ),
+        sa.and_(
+            orders_table.c.side == "sell",
+            orders_table.c.trigger_price_sat >= reference_price,
+        ),
+    )
+    result = await conn.execute(
+        sa.update(orders_table)
+        .where(orders_table.c.token_id == _as_uuid(token_id))
+        .where(orders_table.c.status.in_(_OPEN_ORDER_STATUSES))
+        .where(orders_table.c.order_type == "stop_limit")
+        .where(orders_table.c.triggered_at.is_(None))
+        .where(trigger_condition)
+        .values(triggered_at=now, updated_at=now)
+        .returning(orders_table)
+    )
+    rows = result.fetchall()
+    if rows:
+        await conn.commit()
+    return rows
 
 
 async def get_trade_volume_24h(
