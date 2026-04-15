@@ -321,3 +321,28 @@ enrollments = sa.Table(
     sa.UniqueConstraint("user_id", "course_id", name="uq_enrollments_user_course"),
     sa.CheckConstraint("progress >= 0 AND progress <= 100", name="progress_range"),
 )
+
+disputes = sa.Table(
+    "disputes",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("trade_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("opened_by", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("reason", sa.Text(), nullable=False),
+    sa.Column("status", sa.String(length=10), nullable=False, server_default="open"),
+    sa.Column("resolution", sa.String(length=10), nullable=True),
+    sa.Column("resolved_by", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("NOW()")),
+    sa.ForeignKeyConstraint(["trade_id"], ["trades.id"], name="fk_disputes_trade_id_trades"),
+    sa.ForeignKeyConstraint(["opened_by"], ["users.id"], name="fk_disputes_opened_by_users"),
+    sa.ForeignKeyConstraint(["resolved_by"], ["users.id"], name="fk_disputes_resolved_by_users"),
+    sa.UniqueConstraint("trade_id", name="uq_disputes_trade_id"),
+    sa.Index("ix_disputes_status", "status"),
+    sa.CheckConstraint("status IN ('open', 'resolved')", name="status_allowed"),
+    sa.CheckConstraint(
+        "resolution IS NULL OR resolution IN ('refund', 'release')",
+        name="resolution_allowed",
+    ),
+)
