@@ -91,6 +91,7 @@ def test_target_tables_exist(inspector: sa.Inspector) -> None:
         "treasury",
         "courses",
         "enrollments",
+        "audit_logs",
     }.issubset(table_names)
 
 
@@ -477,5 +478,31 @@ def test_enrollments_schema_matches_spec(inspector: sa.Inspector) -> None:
         name="fk_enrollments_course_id_courses",
         constrained_columns=["course_id"],
         referred_table="courses",
+        referred_columns=["id"],
+    )
+
+
+def test_audit_logs_schema_matches_spec(inspector: sa.Inspector) -> None:
+    columns = _column_map(inspector, "audit_logs")
+    indexes = _constraint_names(inspector.get_indexes("audit_logs"))
+    foreign_keys = inspector.get_foreign_keys("audit_logs")
+    checks = _constraint_names(inspector.get_check_constraints("audit_logs"))
+
+    assert columns["service_name"]["nullable"] is False
+    assert columns["action"]["nullable"] is False
+    assert columns["actor_id"]["nullable"] is True
+    assert columns["request_id"]["nullable"] is False
+    assert columns["request_method"]["nullable"] is False
+    assert columns["request_path"]["nullable"] is False
+    assert columns["metadata"]["nullable"] is True
+    assert columns["created_at"]["default"] is not None
+
+    assert {"ix_audit_logs_action", "ix_audit_logs_actor_id", "ix_audit_logs_created_at"}.issubset(indexes)
+    assert "ck_audit_logs_outcome_allowed" in checks
+    _assert_foreign_key(
+        foreign_keys,
+        name="fk_audit_logs_actor_id_users",
+        constrained_columns=["actor_id"],
+        referred_table="users",
         referred_columns=["id"],
     )

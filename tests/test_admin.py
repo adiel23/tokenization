@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import os
 import sys
 from typing import NamedTuple
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import uuid
 
 import pytest
@@ -279,10 +279,12 @@ def test_admin_can_update_user_role(client):
     target = _make_user(role="user")
     updated = target._replace(role="seller")
     token = _issue_token(admin, settings.jwt_secret)
+    audit_mock = AsyncMock()
 
     with (
         patch("services.admin.main.get_user_by_id", AsyncMock(return_value=admin)),
         patch("services.admin.main.update_user_role", AsyncMock(return_value=updated)),
+        patch("services.admin.main.record_audit_event", audit_mock),
     ):
         response = app_client.patch(
             f"/users/{target.id}",
@@ -292,6 +294,17 @@ def test_admin_can_update_user_role(client):
 
     assert response.status_code == 200
     assert response.json()["role"] == "seller"
+    audit_mock.assert_awaited_once_with(
+        ANY,
+        settings=settings,
+        request=ANY,
+        action="admin.user_role.update",
+        actor_id=str(admin.id),
+        actor_role="admin",
+        target_type="user",
+        target_id=target.id,
+        metadata={"new_role": "seller"},
+    )
 
 
 def test_admin_cannot_update_role_to_invalid_value(client):
@@ -388,10 +401,12 @@ def test_admin_can_disburse_treasury_funds(client):
     admin = _make_user(role="admin")
     entry = _make_treasury_entry(entry_type="disbursement", amount=500000, balance=14500000)
     token = _issue_token(admin, settings.jwt_secret)
+    audit_mock = AsyncMock()
 
     with (
         patch("services.admin.main.get_user_by_id", AsyncMock(return_value=admin)),
         patch("services.admin.main.disburse_treasury", AsyncMock(return_value=entry)),
+        patch("services.admin.main.record_audit_event", audit_mock),
     ):
         response = app_client.post(
             "/treasury/disburse",
@@ -403,6 +418,17 @@ def test_admin_can_disburse_treasury_funds(client):
     data = response.json()
     assert data["entry"]["type"] == "disbursement"
     assert data["entry"]["amount_sat"] == 500000
+    audit_mock.assert_awaited_once_with(
+        ANY,
+        settings=settings,
+        request=ANY,
+        action="admin.treasury.disburse",
+        actor_id=str(admin.id),
+        actor_role="admin",
+        target_type="treasury_entry",
+        target_id=entry.id,
+        metadata={"amount_sat": 500000, "balance_after_sat": 14500000},
+    )
 
 
 def test_treasury_disburse_requires_2fa_when_enabled(client):

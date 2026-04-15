@@ -348,6 +348,7 @@ def test_place_buy_order_matches_resting_sell_order_and_emits_trade_event(client
         locked_amount_sat=trade_row["total_sat"],
     )
     publish_mock = AsyncMock(return_value=None)
+    audit_mock = AsyncMock()
 
     with (
         patch("services.marketplace.main.get_user_by_id", AsyncMock(return_value=fake_user)),
@@ -365,6 +366,7 @@ def test_place_buy_order_matches_resting_sell_order_and_emits_trade_event(client
             AsyncMock(return_value=(trade_row, escrow_row)),
         ) as create_trade_escrow_mock,
         patch.object(marketplace_main._event_bus, "publish", publish_mock),
+        patch("services.marketplace.main.record_audit_event", audit_mock),
     ):
         response = app_client.post(
             "/orders",
@@ -403,6 +405,23 @@ def test_place_buy_order_matches_resting_sell_order_and_emits_trade_event(client
             "multisig_address": escrow_row["multisig_address"],
             "escrow_status": "created",
             "escrow_expires_at": escrow_row["expires_at"].isoformat().replace("+00:00", "Z"),
+        },
+    )
+    audit_mock.assert_awaited_once_with(
+        ANY,
+        settings=settings,
+        request=ANY,
+        action="marketplace.order.place",
+        actor_id=str(fake_user.id),
+        actor_role="user",
+        target_type="order",
+        target_id=filled_buy_order["id"],
+        metadata={
+            "token_id": str(token_id),
+            "side": "buy",
+            "quantity": 10,
+            "price_sat": 100_000,
+            "matched_trades": 1,
         },
     )
 

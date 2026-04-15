@@ -10,7 +10,7 @@ import uuid
 from collections import namedtuple
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 import pytest
@@ -229,6 +229,7 @@ class TestOnchainWithdrawal:
         access_token = _issue_access_token(fake_user, settings.jwt_secret)
         now = 1_700_000_000.0
         valid_code = _totp(secret, now)
+        audit_mock = AsyncMock()
         created_row = FakeTransaction(
             id=uuid.uuid4(),
             wallet_id=fake_wallet.id,
@@ -248,6 +249,7 @@ class TestOnchainWithdrawal:
             patch("services.wallet.main.get_user_by_id", AsyncMock(return_value=fake_user)),
             patch("services.wallet.main.get_or_create_wallet", AsyncMock(return_value=fake_wallet)),
             patch("services.wallet.main.create_onchain_withdrawal", AsyncMock(return_value=created_row)),
+            patch("services.wallet.main.record_audit_event", audit_mock),
         ):
             resp = app_client.post(
                 "/wallet/onchain/withdraw",
@@ -266,6 +268,17 @@ class TestOnchainWithdrawal:
             "fee_sat": 705,
             "status": "pending",
         }
+        audit_mock.assert_awaited_once_with(
+            ANY,
+            settings=settings,
+            request=ANY,
+            action="wallet.onchain_withdraw",
+            actor_id=str(fake_user.id),
+            actor_role="user",
+            target_type="transaction",
+            target_id=created_row.id,
+            metadata={"amount_sat": 100_000, "fee_sat": 705, "address_tail": "fjhx0wlh"},
+        )
 
     def test_withdrawal_rejects_invalid_2fa_code(self, client):
         app_client, _, settings = client
