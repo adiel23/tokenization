@@ -66,6 +66,7 @@ from marketplace.db import (
     process_escrow_signature,
     resolve_dispute,
 )
+from auth.kyc_db import get_kyc_status, is_kyc_verified
 from marketplace.schemas import (
     CancelOrderResponse,
     CancelledOrderOut,
@@ -395,6 +396,70 @@ def _escrow_not_found_error() -> ContractError:
         code="escrow_not_found",
         message="Escrow not found for this trade.",
         status_code=status.HTTP_404_NOT_FOUND,
+    )
+
+
+async def _enforce_kyc_threshold(
+    conn: object,
+    user_id: str,
+    total_value_sat: int,
+) -> None:
+    """Block the order if the trade value exceeds the KYC threshold and
+    the user has not completed identity verification.
+
+    Does nothing when ``kyc_trade_threshold_sat`` is 0 (disabled).
+    """
+    threshold = settings.kyc_trade_threshold_sat
+    if threshold <= 0 or total_value_sat < threshold:
+        return
+
+    kyc_row = await get_kyc_status(conn, user_id)
+    if is_kyc_verified(kyc_row):
+        return
+
+    if kyc_row is None:
+        raise ContractError(
+            code="kyc_required",
+            message=(
+                f"Identity verification is required for trades valued at or above "
+                f"{threshold:,} sats. Please submit a KYC request at /auth/kyc/submit."
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    kyc_status_value = getattr(kyc_row, "status", None)
+    mapping = getattr(kyc_row, "_mapping", None)
+    if mapping is not None:
+        kyc_status_value = mapping.get("status", kyc_status_value)
+
+    if kyc_status_value == "pending":
+        raise ContractError(
+            code="kyc_pending",
+            message=(
+                "Your identity verification is still pending review. "
+                "High-value trades are blocked until verification is approved."
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    if kyc_status_value == "rejected":
+        raise ContractError(
+            code="kyc_rejected",
+            message=(
+                "Your identity verification was rejected. "
+                "Please contact support or resubmit your KYC documents."
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # expired or any other non-verified status
+    raise ContractError(
+        code="kyc_not_verified",
+        message=(
+            "Your identity verification has expired or is incomplete. "
+            "Please resubmit your KYC documents before placing high-value trades."
+        ),
+        status_code=status.HTTP_403_FORBIDDEN,
     )
 
 
@@ -852,6 +917,10 @@ async def place_order(
             available_balance = current_balance - reserved_sell_quantity
             if available_balance < body.quantity:
                 raise _insufficient_token_balance_error()
+
+        # Enforce KYC for high-value trades
+        trade_total_sat = body.quantity * body.price_sat
+        await _enforce_kyc_threshold(conn, principal.id, trade_total_sat)
 
         order_row = await create_order(
             conn,
