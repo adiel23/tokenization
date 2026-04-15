@@ -86,6 +86,8 @@ def fake_settings():
         "LND_TLS_CERT_PATH": "tests/fixtures/tls.cert",
         "TAPD_GRPC_HOST": "localhost",
         "TAPD_GRPC_PORT": "10029",
+        "TAPD_MACAROON_PATH": "tests/fixtures/tapd.macaroon",
+        "TAPD_TLS_CERT_PATH": "tests/fixtures/tapd.cert",
         "NOSTR_RELAYS": "wss://relay.example.com",
         "JWT_SECRET": "test-secret-key-for-unit-tests",
         "JWT_ACCESS_TOKEN_EXPIRE_MINUTES": "15",
