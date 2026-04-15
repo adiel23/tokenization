@@ -4,14 +4,14 @@ import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import sys
 from typing import Any
 import uuid
 
-from fastapi import Depends, FastAPI, Query, Request, Security, status
+from fastapi import Depends, FastAPI, Query, Request, Security, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -22,7 +22,15 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from auth.jwt_utils import decode_token
-from common import InternalEventBus, RedisStreamMirror, get_readiness_payload, get_settings
+from common import (
+    InternalEventBus,
+    RedisStreamFeed,
+    RedisStreamMirror,
+    decode_resume_token,
+    encode_resume_token,
+    get_readiness_payload,
+    get_settings,
+)
 from marketplace.bitcoin_rpc import BitcoinRPCClient, BitcoinRPCError, FundingObservation
 from marketplace.db import (
     cancel_order,
@@ -67,6 +75,7 @@ logger = logging.getLogger(__name__)
 _event_bus = InternalEventBus()
 _event_bus.subscribe("trade.matched", RedisStreamMirror(settings.redis_url))
 _event_bus.subscribe("escrow.funded", RedisStreamMirror(settings.redis_url))
+_realtime_feed = RedisStreamFeed(settings.redis_url)
 _bitcoin_rpc_client = (
     BitcoinRPCClient(
         host=settings.bitcoin_rpc_host,
@@ -326,6 +335,14 @@ def _invalid_access_token_error() -> ContractError:
     )
 
 
+def _invalid_resume_token_error() -> ContractError:
+    return ContractError(
+        code="invalid_resume_token",
+        message="Resume token is invalid.",
+        status_code=status.HTTP_400_BAD_REQUEST,
+    )
+
+
 def _trade_not_found_error() -> ContractError:
     return ContractError(
         code="trade_not_found",
@@ -408,9 +425,13 @@ async def _get_current_principal(
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
 
+    return await _principal_from_access_token(credentials.credentials)
+
+
+async def _principal_from_access_token(access_token: str) -> AuthenticatedPrincipal:
     try:
         claims = decode_token(
-            credentials.credentials,
+            access_token,
             _jwt_secret(),
             expected_type="access",
         )
@@ -429,6 +450,164 @@ async def _get_current_principal(
         raise _invalid_access_token_error()
 
     return AuthenticatedPrincipal(id=user_id, role=role)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _best_prices(rows: list[object]) -> tuple[int | None, int | None]:
+    best_bid: int | None = None
+    best_ask: int | None = None
+
+    for row in rows:
+        status_value = _row_value(row, "status")
+        if status_value not in {"open", "partially_filled"}:
+            continue
+
+        remaining_quantity = _remaining_quantity(row)
+        if remaining_quantity <= 0:
+            continue
+
+        price_sat = int(_row_value(row, "price_sat", 0))
+        if _row_value(row, "side") == "buy":
+            if best_bid is None or price_sat > best_bid:
+                best_bid = price_sat
+        else:
+            if best_ask is None or price_sat < best_ask:
+                best_ask = price_sat
+
+    return best_bid, best_ask
+
+
+async def _price_snapshot(token_id: uuid.UUID) -> dict[str, Any] | None:
+    async with _runtime_engine().connect() as conn:
+        token_row = await get_token_by_id(conn, token_id)
+        if token_row is None:
+            return None
+
+        rows = await list_orders(conn, token_id=token_id)
+        last_trade_price = await get_last_trade_price_for_token(conn, token_id)
+        volume_24h = await get_trade_volume_24h(conn, token_id)
+
+    bid, ask = _best_prices(rows)
+    return {
+        "token_id": str(token_id),
+        "last_price_sat": int(last_trade_price) if last_trade_price is not None else None,
+        "bid": bid,
+        "ask": ask,
+        "volume_24h": int(volume_24h),
+        "timestamp": _utc_now_iso(),
+    }
+
+
+def _price_message(event_id: str | None, snapshot: dict[str, Any]) -> dict[str, Any]:
+    message = {
+        "event": "price_update",
+        "data": snapshot,
+    }
+    if event_id is not None:
+        message["id"] = event_id
+    return message
+
+
+def _notification_message(principal_id: str, *, topic: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if topic == "trade.matched":
+        if payload.get("buyer_id") == principal_id:
+            order_id = payload.get("buy_order_id")
+        elif payload.get("seller_id") == principal_id:
+            order_id = payload.get("sell_order_id")
+        else:
+            return None
+
+        return {
+            "event": "order_filled",
+            "data": {
+                "order_id": order_id,
+                "trade_id": payload.get("trade_id"),
+                "token_id": payload.get("token_id"),
+                "filled_quantity": payload.get("quantity"),
+                "price_sat": payload.get("price_sat"),
+                "status": payload.get("status"),
+            },
+        }
+
+    if topic == "escrow.funded":
+        participant_ids = {payload.get("buyer_id"), payload.get("seller_id")}
+        if principal_id not in participant_ids:
+            return None
+
+        return {
+            "event": "escrow_funded",
+            "data": {
+                "trade_id": payload.get("trade_id"),
+                "token_id": payload.get("token_id"),
+                "escrow_id": payload.get("escrow_id"),
+                "txid": payload.get("funding_txid"),
+                "status": payload.get("status"),
+            },
+        }
+
+    if topic == "ai.evaluation.complete":
+        if payload.get("owner_id") != principal_id:
+            return None
+
+        return {
+            "event": "ai_evaluation_complete",
+            "data": {
+                "asset_id": payload.get("asset_id"),
+                "ai_score": payload.get("ai_score"),
+                "projected_roi": payload.get("projected_roi"),
+                "status": payload.get("status"),
+                "completed_at": payload.get("completed_at"),
+            },
+        }
+
+    return None
+
+
+async def _websocket_auth_payload(websocket: WebSocket) -> dict[str, Any]:
+    access_token = websocket.query_params.get("access_token")
+    resume_token = websocket.query_params.get("resume_token")
+
+    if access_token:
+        return {
+            "access_token": access_token,
+            "resume_token": resume_token,
+        }
+
+    authorization = websocket.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return {
+            "access_token": authorization[7:].strip(),
+            "resume_token": resume_token,
+        }
+
+    try:
+        message = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+    except Exception as exc:
+        raise ContractError(
+            code="authentication_required",
+            message="Authentication is required.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        ) from exc
+
+    if not isinstance(message, dict):
+        raise ContractError(
+            code="authentication_required",
+            message="Authentication is required.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    return {
+        "access_token": message.get("access_token"),
+        "resume_token": message.get("resume_token", resume_token),
+    }
+
+
+async def _close_websocket_for_contract_error(websocket: WebSocket, exc: ContractError) -> None:
+    await websocket.send_json({"error": {"code": exc.code, "message": exc.message}})
+    await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.message)
 
 
 @app.get("/health")
@@ -723,6 +902,92 @@ async def get_trade_history(
         trades=[_trade_out(row) for row in page],
         next_cursor=next_cursor,
     ).model_dump(mode="json")
+
+
+@app.websocket("/ws/prices/{token_id}")
+async def price_stream(websocket: WebSocket, token_id: uuid.UUID):
+    last_event_id = websocket.query_params.get("last_event_id")
+
+    await websocket.accept()
+
+    if last_event_id is None:
+        snapshot = await _price_snapshot(token_id)
+        if snapshot is None:
+            await websocket.send_json(
+                {
+                    "error": {
+                        "code": "token_not_found",
+                        "message": "Token not found.",
+                    }
+                }
+            )
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Token not found.")
+            return
+
+        await websocket.send_json(_price_message(None, snapshot))
+
+    try:
+        async for stream_event in _realtime_feed.listen(
+            ["trade.matched"],
+            resume_from={"trade.matched": last_event_id} if last_event_id else None,
+        ):
+            if stream_event.payload.get("token_id") != str(token_id):
+                continue
+
+            snapshot = await _price_snapshot(token_id)
+            if snapshot is None:
+                continue
+
+            await websocket.send_json(_price_message(stream_event.event_id, snapshot))
+    except WebSocketDisconnect:
+        return
+
+
+@app.websocket("/ws/notifications")
+async def notification_stream(websocket: WebSocket):
+    await websocket.accept()
+
+    try:
+        auth_payload = await _websocket_auth_payload(websocket)
+        access_token = auth_payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ContractError(
+                code="authentication_required",
+                message="Authentication is required.",
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        principal = await _principal_from_access_token(access_token)
+
+        try:
+            resume_from = decode_resume_token(
+                auth_payload.get("resume_token"),
+                allowed_topics={"trade.matched", "escrow.funded", "ai.evaluation.complete"},
+            )
+        except ValueError as exc:
+            raise _invalid_resume_token_error() from exc
+    except ContractError as exc:
+        await _close_websocket_for_contract_error(websocket, exc)
+        return
+
+    try:
+        async for stream_event in _realtime_feed.listen(
+            ["trade.matched", "escrow.funded", "ai.evaluation.complete"],
+            resume_from=resume_from or None,
+        ):
+            message = _notification_message(
+                principal.id,
+                topic=stream_event.topic,
+                payload=stream_event.payload,
+            )
+            if message is None:
+                continue
+
+            message["id"] = f"{stream_event.topic}:{stream_event.event_id}"
+            message["resume_token"] = encode_resume_token(stream_event.positions)
+            await websocket.send_json(message)
+    except WebSocketDisconnect:
+        return
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services.auth.jwt_utils import issue_token_pair
+from services.common.realtime import StreamEvent
 
 
 class FakeUser(NamedTuple):
@@ -212,6 +213,11 @@ def _issue_access_token(user: FakeUser, secret: str) -> str:
 
 def _auth_headers(access_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
+
+
+async def _stream_events(events: list[StreamEvent]):
+    for event in events:
+        yield event
 
 
 def test_place_sell_order_rejects_when_reserved_balance_exhausts_holdings(client):
@@ -1272,3 +1278,229 @@ def test_get_trade_history_paginates_and_filters_by_token(client):
                 "settled_at",
             }
             assert trade["token_id"] != str(other_token_id)
+
+
+def test_price_websocket_streams_live_updates_for_a_token(client):
+    app_client, marketplace_main, _ = client
+    token_id = uuid.uuid4()
+    initial_snapshot = {
+        "token_id": str(token_id),
+        "last_price_sat": 100_000,
+        "bid": 99_500,
+        "ask": 100_500,
+        "volume_24h": 20,
+        "timestamp": "2026-04-15T01:00:00Z",
+    }
+    updated_snapshot = {
+        "token_id": str(token_id),
+        "last_price_sat": 101_000,
+        "bid": 100_500,
+        "ask": 101_500,
+        "volume_24h": 25,
+        "timestamp": "2026-04-15T01:00:05Z",
+    }
+    stream_event = StreamEvent(
+        topic="trade.matched",
+        event_id="1713142805000-0",
+        payload={"token_id": str(token_id)},
+        positions={"trade.matched": "1713142805000-0"},
+    )
+
+    with (
+        patch("services.marketplace.main._price_snapshot", AsyncMock(side_effect=[initial_snapshot, updated_snapshot])),
+        patch.object(
+            marketplace_main._realtime_feed,
+            "listen",
+            side_effect=lambda *args, **kwargs: _stream_events([stream_event]),
+        ) as listen_mock,
+    ):
+        with app_client.websocket_connect(f"/ws/prices/{token_id}") as websocket:
+            first_message = websocket.receive_json()
+            second_message = websocket.receive_json()
+
+    assert first_message == {
+        "event": "price_update",
+        "data": initial_snapshot,
+    }
+    assert second_message == {
+        "event": "price_update",
+        "id": "1713142805000-0",
+        "data": updated_snapshot,
+    }
+    listen_mock.assert_called_once_with(["trade.matched"], resume_from=None)
+
+
+def test_notifications_websocket_requires_authentication_and_filters_personal_events(client):
+    app_client, marketplace_main, settings = client
+    fake_user = _make_fake_user(role="seller")
+    access_token = _issue_access_token(fake_user, settings.jwt_secret)
+    stream_events = [
+        StreamEvent(
+            topic="trade.matched",
+            event_id="1713142805000-0",
+            payload={
+                "trade_id": str(uuid.uuid4()),
+                "token_id": str(uuid.uuid4()),
+                "buy_order_id": str(uuid.uuid4()),
+                "sell_order_id": str(uuid.uuid4()),
+                "buyer_id": str(uuid.uuid4()),
+                "seller_id": str(fake_user.id),
+                "quantity": 4,
+                "price_sat": 100_000,
+                "status": "pending",
+            },
+            positions={
+                "trade.matched": "1713142805000-0",
+                "escrow.funded": "$",
+                "ai.evaluation.complete": "$",
+            },
+        ),
+        StreamEvent(
+            topic="escrow.funded",
+            event_id="1713142810000-0",
+            payload={
+                "trade_id": str(uuid.uuid4()),
+                "token_id": str(uuid.uuid4()),
+                "escrow_id": str(uuid.uuid4()),
+                "buyer_id": str(uuid.uuid4()),
+                "seller_id": str(uuid.uuid4()),
+                "funding_txid": "ab" * 32,
+                "status": "funded",
+            },
+            positions={
+                "trade.matched": "1713142805000-0",
+                "escrow.funded": "1713142810000-0",
+                "ai.evaluation.complete": "$",
+            },
+        ),
+        StreamEvent(
+            topic="ai.evaluation.complete",
+            event_id="1713142815000-0",
+            payload={
+                "asset_id": str(uuid.uuid4()),
+                "owner_id": str(fake_user.id),
+                "ai_score": 83.5,
+                "projected_roi": 9.2,
+                "status": "approved",
+                "completed_at": "2026-04-15T01:00:15Z",
+            },
+            positions={
+                "trade.matched": "1713142805000-0",
+                "escrow.funded": "1713142810000-0",
+                "ai.evaluation.complete": "1713142815000-0",
+            },
+        ),
+    ]
+
+    with (
+        patch("services.marketplace.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+        patch.object(
+            marketplace_main._realtime_feed,
+            "listen",
+            side_effect=lambda *args, **kwargs: _stream_events(stream_events),
+        ),
+    ):
+        with app_client.websocket_connect(f"/ws/notifications?access_token={access_token}") as websocket:
+            first_message = websocket.receive_json()
+            second_message = websocket.receive_json()
+
+    assert first_message["event"] == "order_filled"
+    assert first_message["data"]["order_id"] == stream_events[0].payload["sell_order_id"]
+    assert first_message["data"]["filled_quantity"] == 4
+    assert first_message["resume_token"]
+
+    assert second_message == {
+        "event": "ai_evaluation_complete",
+        "id": "ai.evaluation.complete:1713142815000-0",
+        "resume_token": second_message["resume_token"],
+        "data": {
+            "asset_id": stream_events[2].payload["asset_id"],
+            "ai_score": 83.5,
+            "projected_roi": 9.2,
+            "status": "approved",
+            "completed_at": "2026-04-15T01:00:15Z",
+        },
+    }
+    assert second_message["resume_token"] != first_message["resume_token"]
+
+
+def test_notifications_websocket_replays_from_resume_token(client):
+    app_client, marketplace_main, settings = client
+    fake_user = _make_fake_user(role="user")
+    access_token = _issue_access_token(fake_user, settings.jwt_secret)
+    trade_positions = {
+        "trade.matched": "1713142900000-0",
+        "escrow.funded": "$",
+        "ai.evaluation.complete": "$",
+    }
+    replay_positions = {
+        "trade.matched": "1713142900000-0",
+        "escrow.funded": "1713142910000-0",
+        "ai.evaluation.complete": "$",
+    }
+    first_event = StreamEvent(
+        topic="trade.matched",
+        event_id="1713142900000-0",
+        payload={
+            "trade_id": str(uuid.uuid4()),
+            "token_id": str(uuid.uuid4()),
+            "buy_order_id": str(uuid.uuid4()),
+            "sell_order_id": str(uuid.uuid4()),
+            "buyer_id": str(fake_user.id),
+            "seller_id": str(uuid.uuid4()),
+            "quantity": 2,
+            "price_sat": 99_000,
+            "status": "pending",
+        },
+        positions=trade_positions,
+    )
+    replay_event = StreamEvent(
+        topic="escrow.funded",
+        event_id="1713142910000-0",
+        payload={
+            "trade_id": first_event.payload["trade_id"],
+            "token_id": first_event.payload["token_id"],
+            "escrow_id": str(uuid.uuid4()),
+            "buyer_id": str(fake_user.id),
+            "seller_id": str(uuid.uuid4()),
+            "funding_txid": "cd" * 32,
+            "status": "funded",
+        },
+        positions=replay_positions,
+    )
+
+    listen_calls: list[dict[str, Any] | None] = []
+
+    def _listen(*args, **kwargs):
+        listen_calls.append(kwargs.get("resume_from"))
+        if len(listen_calls) == 1:
+            return _stream_events([first_event])
+        return _stream_events([replay_event])
+
+    with (
+        patch("services.marketplace.main.get_user_by_id", AsyncMock(return_value=fake_user)),
+        patch.object(marketplace_main._realtime_feed, "listen", side_effect=_listen),
+    ):
+        with app_client.websocket_connect(f"/ws/notifications?access_token={access_token}") as websocket:
+            first_message = websocket.receive_json()
+
+        resume_token = first_message["resume_token"]
+
+        with app_client.websocket_connect(
+            f"/ws/notifications?access_token={access_token}&resume_token={resume_token}"
+        ) as websocket:
+            replay_message = websocket.receive_json()
+
+    assert listen_calls == [None, trade_positions]
+    assert replay_message == {
+        "event": "escrow_funded",
+        "id": "escrow.funded:1713142910000-0",
+        "resume_token": replay_message["resume_token"],
+        "data": {
+            "trade_id": replay_event.payload["trade_id"],
+            "token_id": replay_event.payload["token_id"],
+            "escrow_id": replay_event.payload["escrow_id"],
+            "txid": "cd" * 32,
+            "status": "funded",
+        },
+    }
