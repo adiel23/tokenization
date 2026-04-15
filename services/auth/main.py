@@ -49,6 +49,11 @@ from common.alerting import alert_dispatcher, AlertSeverity, configure_alerting
 
 from .schemas import (
     AuthResponse,
+    KycAdminUpdateRequest,
+    KycListResponse,
+    KycStatusOut,
+    KycStatusResponse,
+    KycSubmitRequest,
     LoginRequest,
     LogoutRequest,
     MessageResponse,
@@ -75,6 +80,12 @@ from .db import (
     get_user_by_id,
     revoke_refresh_session,
     rotate_refresh_session,
+)
+from .kyc_db import (
+    create_kyc_record,
+    get_kyc_status,
+    list_kyc_records,
+    update_kyc_status,
 )
 
 import bcrypt
@@ -717,6 +728,148 @@ async def auditor_role_check(
     principal: AuthenticatedPrincipal = Depends(_require_roles("auditor", "admin")),
 ):
     return _role_response(principal, "auditor", "admin")
+
+
+# ---------------------------------------------------------------------------
+# KYC Verification Endpoints
+# ---------------------------------------------------------------------------
+
+
+def _kyc_out(row) -> KycStatusOut:
+    mapping = getattr(row, "_mapping", None)
+    def _val(key: str, default=None):
+        if mapping is not None:
+            return mapping.get(key, default)
+        return getattr(row, key, default)
+    return KycStatusOut(
+        id=str(_val("id")),
+        user_id=str(_val("user_id")),
+        status=_val("status"),
+        reviewed_by=str(_val("reviewed_by")) if _val("reviewed_by") else None,
+        reviewed_at=_val("reviewed_at"),
+        rejection_reason=_val("rejection_reason"),
+        notes=_val("notes"),
+        created_at=_val("created_at"),
+        updated_at=_val("updated_at"),
+    )
+
+
+@app.post(
+    "/auth/kyc/submit",
+    status_code=status.HTTP_201_CREATED,
+    response_model=KycStatusResponse,
+    summary="Submit KYC verification request",
+)
+async def submit_kyc(
+    body: KycSubmitRequest,
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    """Submit a KYC verification request.
+
+    Creates or returns the existing record.  Once submitted the platform
+    operator reviews and approves/rejects via the admin endpoint.
+    """
+    async with _engine.connect() as conn:
+        existing = await get_kyc_status(conn, principal.id)
+        if existing is not None:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=KycStatusResponse(kyc=_kyc_out(existing)).model_dump(mode="json"),
+            )
+
+        row = await create_kyc_record(
+            conn,
+            user_id=principal.id,
+            document_url=body.document_url,
+            notes=body.notes,
+        )
+
+    record_business_event("kyc_submit")
+    return KycStatusResponse(kyc=_kyc_out(row)).model_dump(mode="json")
+
+
+@app.get(
+    "/auth/kyc/status",
+    response_model=KycStatusResponse,
+    summary="Get the current user's KYC verification status",
+)
+async def get_my_kyc_status(
+    principal: AuthenticatedPrincipal = Depends(_get_current_principal),
+):
+    """Return the verification status of the authenticated user.
+
+    Returns 404 if the user has not submitted a KYC request.
+    """
+    async with _engine.connect() as conn:
+        row = await get_kyc_status(conn, principal.id)
+
+    if row is None:
+        return _error(
+            "kyc_not_found",
+            "No KYC verification record found. Please submit a KYC request first.",
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    return KycStatusResponse(kyc=_kyc_out(row)).model_dump(mode="json")
+
+
+@app.get(
+    "/auth/kyc/admin",
+    response_model=KycListResponse,
+    summary="List all KYC verification records (admin only)",
+)
+async def list_kyc_admin(
+    status_filter: str | None = None,
+    principal: AuthenticatedPrincipal = Depends(_require_roles("admin")),
+):
+    """Return all KYC records.  Admins can filter by status."""
+    async with _engine.connect() as conn:
+        rows = await list_kyc_records(conn, status_filter=status_filter)
+
+    return KycListResponse(
+        records=[_kyc_out(r) for r in rows],
+    ).model_dump(mode="json")
+
+
+@app.put(
+    "/auth/kyc/admin/{user_id}",
+    response_model=KycStatusResponse,
+    summary="Update a user's KYC verification status (admin only)",
+)
+async def update_kyc_admin(
+    request: Request,
+    user_id: str,
+    body: KycAdminUpdateRequest,
+    principal: AuthenticatedPrincipal = Depends(_require_roles("admin")),
+):
+    """Admin-only endpoint to approve, reject, or expire a user's KYC status."""
+    async with _engine.connect() as conn:
+        existing = await get_kyc_status(conn, user_id)
+        if existing is None:
+            return _error(
+                "kyc_not_found",
+                "No KYC verification record found for this user.",
+                status.HTTP_404_NOT_FOUND,
+            )
+
+        row = await update_kyc_status(
+            conn,
+            user_id=user_id,
+            new_status=body.status,
+            reviewed_by=principal.id,
+            rejection_reason=body.rejection_reason,
+            notes=body.notes,
+        )
+
+    if row is None:
+        return _error(
+            "kyc_update_failed",
+            "Failed to update KYC status.",
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    record_business_event("kyc_admin_update")
+    return KycStatusResponse(kyc=_kyc_out(row)).model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------

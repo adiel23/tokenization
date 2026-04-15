@@ -111,3 +111,42 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+
+# ---------------------------------------------------------------------------
+# KYC verification schemas
+# ---------------------------------------------------------------------------
+
+KycStatus = Literal["pending", "verified", "rejected", "expired"]
+
+
+class KycSubmitRequest(BaseModel):
+    document_url: str | None = Field(default=None, max_length=2048)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class KycAdminUpdateRequest(BaseModel):
+    status: KycStatus
+    rejection_reason: str | None = Field(default=None, max_length=2000)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class KycStatusOut(BaseModel):
+    id: str
+    user_id: str
+    status: KycStatus
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
+    rejection_reason: str | None = None
+    notes: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class KycStatusResponse(BaseModel):
+    kyc: KycStatusOut
+
+
+class KycListResponse(BaseModel):
+    records: list[KycStatusOut]
+
