@@ -19,7 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 _IMMUTABILITY_FUNCTION = """
-CREATE FUNCTION prevent_audit_log_mutation()
+CREATE OR REPLACE FUNCTION prevent_audit_log_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -30,7 +30,7 @@ $$;
 """
 
 
-_DROP_IMMUTABILITY_FUNCTION = "DROP FUNCTION IF EXISTS prevent_audit_log_mutation();"
+_DROP_IMMUTABILITY_FUNCTION = "DROP FUNCTION IF EXISTS prevent_audit_log_mutation() CASCADE;"
 
 
 def upgrade() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -25,11 +26,9 @@ def _alembic_config() -> Config:
 
 
 def _reset_database(engine: sa.Engine) -> None:
-    metadata = sa.MetaData()
-
     with engine.begin() as connection:
-        metadata.reflect(bind=connection)
-        metadata.drop_all(bind=connection)
+        connection.execute(sa.text("DROP SCHEMA IF EXISTS public CASCADE"))
+        connection.execute(sa.text("CREATE SCHEMA public"))
 
 
 def _column_map(inspector: sa.Inspector, table_name: str) -> dict[str, dict[str, object]]:
@@ -69,7 +68,9 @@ def inspector() -> sa.Inspector:
         command.upgrade(config, "head")
         yield sa.inspect(engine)
     finally:
-        command.downgrade(config, "base")
+        with contextlib.suppress(Exception):
+            command.downgrade(config, "base")
+        _reset_database(engine)
         engine.dispose()
 
 
