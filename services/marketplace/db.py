@@ -690,3 +690,111 @@ async def mark_escrow_funded(
         raise
 
     return trade_row, escrow_row
+
+
+_SIGNATURE_THRESHOLD = 2
+
+
+async def process_escrow_signature(
+    conn: AsyncConnection,
+    *,
+    escrow_row: object,
+    trade_row: object,
+    buy_order: object,
+    sell_order: object,
+    signer_role: str,
+    signature: str,
+    platform_signature: str,
+) -> tuple[sa.engine.Row, sa.engine.Row]:
+    """Record a party's signature and the platform counter-signature.
+
+    If the 2-of-3 threshold is satisfied the escrow is released and the
+    trade is settled atomically: buyer receives tokens, seller is credited
+    with the sale proceeds, and the buyer's wallet is debited.
+
+    Returns ``(trade_row, escrow_row)`` reflecting the final state.
+    """
+    escrow_id = _as_uuid(_row_value(escrow_row, "id"))
+    trade_id = _as_uuid(_row_value(trade_row, "id"))
+    now = _utc_now()
+
+    existing: dict = _row_value(escrow_row, "collected_signatures") or {}
+    updated_sigs = dict(existing)
+    updated_sigs[signer_role] = signature
+    updated_sigs["platform"] = platform_signature
+
+    threshold_met = len(updated_sigs) >= _SIGNATURE_THRESHOLD
+
+    try:
+        if threshold_met:
+            release_txid = _generate_release_txid(escrow_id, trade_id)
+
+            escrow_result = await conn.execute(
+                sa.update(escrows_table)
+                .where(escrows_table.c.id == escrow_id)
+                .where(escrows_table.c.status == "funded")
+                .values(
+                    collected_signatures=updated_sigs,
+                    release_txid=release_txid,
+                    status="released",
+                    updated_at=now,
+                )
+                .returning(escrows_table)
+            )
+            escrow_row = escrow_result.fetchone()
+            if escrow_row is None:
+                raise LookupError("escrow_not_found_or_state_conflict")
+
+            trade_result = await conn.execute(
+                sa.update(trades_table)
+                .where(trades_table.c.id == trade_id)
+                .values(status="settled", settled_at=now)
+                .returning(trades_table)
+            )
+            trade_row = trade_result.fetchone()
+            if trade_row is None:
+                raise LookupError("trade_not_found")
+
+            buyer_id = _row_value(buy_order, "user_id")
+            seller_id = _row_value(sell_order, "user_id")
+            token_id = _row_value(trade_row, "token_id")
+            quantity = int(_row_value(trade_row, "quantity", 0))
+            total_sat = int(_row_value(trade_row, "total_sat", 0))
+
+            buyer_wallet = await get_wallet_by_user_id(conn, buyer_id)
+            seller_wallet = await get_wallet_by_user_id(conn, seller_id)
+            if buyer_wallet is None or seller_wallet is None:
+                raise LookupError("wallet_not_found")
+
+            await debit_wallet_balance(conn, wallet_row=buyer_wallet, amount_sat=total_sat)
+            await credit_wallet_balance(conn, wallet_row=seller_wallet, amount_sat=total_sat)
+            await increment_token_balance(conn, user_id=buyer_id, token_id=token_id, quantity=quantity)
+        else:
+            escrow_result = await conn.execute(
+                sa.update(escrows_table)
+                .where(escrows_table.c.id == escrow_id)
+                .where(escrows_table.c.status == "funded")
+                .values(
+                    collected_signatures=updated_sigs,
+                    updated_at=now,
+                )
+                .returning(escrows_table)
+            )
+            escrow_row = escrow_result.fetchone()
+            if escrow_row is None:
+                raise LookupError("escrow_not_found_or_state_conflict")
+
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+    return trade_row, escrow_row
+
+
+def _generate_release_txid(escrow_id: uuid.UUID, trade_id: uuid.UUID) -> str:
+    import hashlib
+    import time as _time
+
+    payload = f"release:{escrow_id}:{trade_id}:{_time.time_ns()}".encode()
+    return hashlib.sha256(payload).hexdigest()

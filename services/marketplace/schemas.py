@@ -85,9 +85,14 @@ class EscrowOut(BaseModel):
     multisig_address: str
     locked_amount_sat: int
     funding_txid: str | None = None
+    release_txid: str | None = None
     status: EscrowStatus
     expires_at: datetime
 
 
 class EscrowResponse(BaseModel):
     escrow: EscrowOut
+
+
+class EscrowSignRequest(BaseModel):
+    partial_signature: str = Field(min_length=1)
