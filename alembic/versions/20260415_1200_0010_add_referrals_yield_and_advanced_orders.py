@@ -33,7 +33,7 @@ def upgrade() -> None:
     op.create_unique_constraint("uq_users_referral_code", "users", ["referral_code"])
     op.create_index("ix_users_referrer_id", "users", ["referrer_id"])
     op.create_check_constraint(
-        "ck_users_self_referral_blocked",
+        "self_referral_blocked",
         "users",
         "referrer_id IS NULL OR referrer_id <> id",
     )
@@ -43,17 +43,17 @@ def upgrade() -> None:
     op.add_column("orders", sa.Column("triggered_at", sa.DateTime(timezone=True), nullable=True))
     op.create_index("ix_orders_order_type", "orders", ["order_type"])
     op.create_check_constraint(
-        "ck_orders_order_type_allowed",
+        "order_type_allowed",
         "orders",
         "order_type IN ('limit', 'stop_limit')",
     )
     op.create_check_constraint(
-        "ck_orders_trigger_price_sat_positive",
+        "trigger_price_sat_positive",
         "orders",
         "trigger_price_sat IS NULL OR trigger_price_sat > 0",
     )
     op.create_check_constraint(
-        "ck_orders_trigger_price_required",
+        "trigger_price_required",
         "orders",
         "(order_type = 'limit' AND trigger_price_sat IS NULL) OR "
         "(order_type = 'stop_limit' AND trigger_price_sat IS NOT NULL)",
@@ -109,7 +109,7 @@ def upgrade() -> None:
     op.create_index("ix_yield_accruals_token_id", "yield_accruals", ["token_id"])
     op.create_index("ix_yield_accruals_created_at", "yield_accruals", ["created_at"])
 
-    op.drop_constraint("ck_treasury_type_allowed", "treasury", type_="check")
+    op.drop_constraint("type_allowed", "treasury", type_="check")
     op.add_column("treasury", sa.Column("source_referral_reward_id", postgresql.UUID(as_uuid=True), nullable=True))
     op.create_foreign_key(
         "fk_treasury_source_referral_reward_id_referral_rewards",
@@ -124,14 +124,14 @@ def upgrade() -> None:
         ["source_referral_reward_id"],
     )
     op.create_check_constraint(
-        "ck_treasury_type_allowed",
+        "type_allowed",
         "treasury",
         "type IN ('fee_income', 'disbursement', 'adjustment', 'referral_reward')",
     )
 
 
 def downgrade() -> None:
-    op.drop_constraint("ck_treasury_type_allowed", "treasury", type_="check")
+    op.drop_constraint("type_allowed", "treasury", type_="check")
     op.drop_constraint("uq_treasury_source_referral_reward_id", "treasury", type_="unique")
     op.drop_constraint(
         "fk_treasury_source_referral_reward_id_referral_rewards",
@@ -140,7 +140,7 @@ def downgrade() -> None:
     )
     op.drop_column("treasury", "source_referral_reward_id")
     op.create_check_constraint(
-        "ck_treasury_type_allowed",
+        "type_allowed",
         "treasury",
         "type IN ('fee_income', 'disbursement', 'adjustment')",
     )
@@ -155,15 +155,15 @@ def downgrade() -> None:
     op.drop_index("ix_referral_rewards_referrer_id", table_name="referral_rewards")
     op.drop_table("referral_rewards")
 
-    op.drop_constraint("ck_orders_trigger_price_required", "orders", type_="check")
-    op.drop_constraint("ck_orders_trigger_price_sat_positive", "orders", type_="check")
-    op.drop_constraint("ck_orders_order_type_allowed", "orders", type_="check")
+    op.drop_constraint("trigger_price_required", "orders", type_="check")
+    op.drop_constraint("trigger_price_sat_positive", "orders", type_="check")
+    op.drop_constraint("order_type_allowed", "orders", type_="check")
     op.drop_index("ix_orders_order_type", table_name="orders")
     op.drop_column("orders", "triggered_at")
     op.drop_column("orders", "trigger_price_sat")
     op.drop_column("orders", "order_type")
 
-    op.drop_constraint("ck_users_self_referral_blocked", "users", type_="check")
+    op.drop_constraint("self_referral_blocked", "users", type_="check")
     op.drop_index("ix_users_referrer_id", table_name="users")
     op.drop_constraint("uq_users_referral_code", "users", type_="unique")
     op.drop_constraint("fk_users_referrer_id_users", "users", type_="foreignkey")
