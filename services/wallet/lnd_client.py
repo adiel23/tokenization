@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any
 
 import grpc
 
-from .lnd_grpc import lightning_pb2 as ln
-from .lnd_grpc import lightning_pb2_grpc as lnrpc
+from lnd_grpc import lightning_pb2 as ln
+from lnd_grpc import lightning_pb2_grpc as lnrpc
 
 if TYPE_CHECKING:
     from services.common.config import Settings
@@ -23,6 +23,28 @@ class LNDClient:
     def _get_stub(self) -> lnrpc.LightningStub:
         if self._stub:
             return self._stub
+
+        # Local development mock fallback
+        if self.settings.env_profile == "local" and not __import__('os').path.exists(self.settings.lnd_tls_cert_path):
+            class _MockStub:
+                def AddInvoice(self, request, *args, **kwargs):
+                    return ln.AddInvoiceResponse(payment_request=f"lnbcrt_mock_{request.value}", r_hash=b"mock_r_hash")
+                def SendPaymentSync(self, request, *args, **kwargs):
+                    return ln.SendResponse(payment_error="", payment_hash=b"mock_r_hash")
+                def LookupInvoice(self, request, *args, **kwargs):
+                    return ln.Invoice(state=1, settle_date=int(__import__('time').time()), value=1000)
+                def GetInfo(self, request, *args, **kwargs):
+                    return ln.GetInfoResponse(identity_pubkey="02mockpubkey")
+                def DecodePayReq(self, request, *args, **kwargs):
+                    return ln.PayReq(num_satoshis=1000, description="Mock invoice")
+                def ChannelBalance(self, request, *args, **kwargs):
+                    resp = ln.ChannelBalanceResponse()
+                    resp.local_balance.sat = 5000000
+                    return resp
+            
+            self._stub = _MockStub()
+            return self._stub
+
 
         try:
             # Read TLS certificate

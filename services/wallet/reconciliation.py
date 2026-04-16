@@ -26,7 +26,7 @@ from .db import (
     update_transaction_status,
     update_transaction_status_by_txid,
 )
-from .lnd_client import LNDClient
+from lnd_client import LNDClient
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +308,7 @@ async def sync_lightning_balance(engine: AsyncEngine, lnd_client: LNDClient) -> 
 
     record_business_event(
         "wallet_lightning_balance_sync",
-        metadata={"wallet_count": len(wallet_rows), "total_balance_sat": total_wallet_balance_sat},
+        labels={"wallet_count": len(wallet_rows), "total_balance_sat": total_wallet_balance_sat},
     )
 
 

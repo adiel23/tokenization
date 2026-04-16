@@ -27,7 +27,10 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 import uvicorn
 
+# Add services directory to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 
 from common import get_readiness_payload, get_settings, install_http_security, record_audit_event
 from common import (
@@ -46,8 +49,8 @@ from common.metrics import metrics, mount_metrics_endpoint, record_business_even
 from common.alerting import alert_dispatcher, AlertSeverity, configure_alerting
 from auth.kyc_db import get_kyc_status, is_kyc_verified
 
-from .auth import get_current_user_id, require_2fa
-from .db import (
+from wallet_auth import get_current_user_id, require_2fa
+from db import (
     create_onchain_withdrawal,
     create_transaction,
     get_db_conn,
@@ -89,7 +92,7 @@ from .schemas import (
     TransactionHistoryResponse,
     TransactionType,
 )
-from .schemas_lnd import (
+from schemas_lnd import (
     Invoice,
     InvoiceCreate,
     InvoiceStatus,
@@ -101,7 +104,7 @@ from .schemas_lnd import (
     RouteHintHop,
     RouteHintOut,
 )
-from .schemas_wallet import (
+from schemas_wallet import (
     TokenBalance,
     WalletResponse,
     WalletSummary,
@@ -210,6 +213,16 @@ async def _noop_lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Wallet Service", lifespan=_lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 install_http_security(
     app,
     settings,
