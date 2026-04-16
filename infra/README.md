@@ -64,6 +64,8 @@ The local stack includes a pre-configured Bitcoin Core node running in `regtest`
 - **Default RPC User**: `local_rpc`
 - **Default RPC Password**: `local_rpc_password`
 
+The local profile template in `infra/.env.local.example` is aligned with these same regtest credentials.
+
 ### Mining Blocks
 
 Since it is a regtest environment, you need to manually mine blocks to confirm transactions. A helper script is provided:
