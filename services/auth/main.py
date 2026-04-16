@@ -38,7 +38,9 @@ import uvicorn
 from jose import JWTError
 
 # Local imports -----------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import get_settings
 from common import (
@@ -58,7 +60,7 @@ from common.logging import configure_structured_logging
 from common.metrics import metrics, mount_metrics_endpoint, record_business_event
 from common.alerting import alert_dispatcher, AlertSeverity, configure_alerting
 
-from .schemas import (
+from schemas import (
     AuthResponse,
     KycAdminUpdateRequest,
     KycListResponse,
@@ -83,9 +85,9 @@ from .schemas import (
     ReferralSummaryResponse,
     ReferredUserOut,
 )
-from .jwt_utils import decode_token, issue_token_pair
-from .nostr_utils import validate_nostr_event, NostrValidationError
-from .db import (
+from jwt_utils import decode_token, issue_token_pair
+from nostr_utils import validate_nostr_event, NostrValidationError
+from db import (
     create_nostr_identity,
     create_nostr_user,
     create_refresh_session,
@@ -98,7 +100,7 @@ from .db import (
     revoke_refresh_session,
     rotate_refresh_session,
 )
-from .kyc_db import (
+from kyc_db import (
     create_kyc_record,
     get_kyc_status,
     is_kyc_verified,
@@ -151,6 +153,16 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Auth Service", lifespan=_lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 install_http_security(
     app,
     settings,

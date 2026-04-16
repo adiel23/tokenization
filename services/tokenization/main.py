@@ -19,7 +19,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 import uvicorn
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from auth.jwt_utils import decode_token
 from google.protobuf.json_format import MessageToDict
@@ -624,6 +626,16 @@ def _require_roles(*allowed_roles: str):
     return dependency
 
 app = FastAPI(title="Tokenization Service", lifespan=_lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 install_http_security(
     app,
     settings,

@@ -22,7 +22,9 @@ from jose import JWTError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 import uvicorn
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from auth.jwt_utils import decode_token
 from common import (

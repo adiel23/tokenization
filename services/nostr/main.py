@@ -10,7 +10,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import get_readiness_payload, get_settings
 from common.metrics import mount_metrics_endpoint, record_business_event
