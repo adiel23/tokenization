@@ -16,8 +16,8 @@ from common.db.metadata import (
     onchain_deposits as deposits_table,
     transactions as transactions_table,
 )
-from .bitcoin_rpc import BitcoinRPCError, get_bitcoin_rpc
-from .db import (
+from bitcoin_rpc import BitcoinRPCError, get_bitcoin_rpc
+from db import (
     list_imported_wallet_addresses,
     list_pending_lightning_receives,
     list_pending_onchain_withdrawals,
@@ -26,7 +26,7 @@ from .db import (
     update_transaction_status,
     update_transaction_status_by_txid,
 )
-from .lnd_client import LNDClient
+from lnd_client import LNDClient
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +308,7 @@ async def sync_lightning_balance(engine: AsyncEngine, lnd_client: LNDClient) -> 
 
     record_business_event(
         "wallet_lightning_balance_sync",
-        metadata={"wallet_count": len(wallet_rows), "total_balance_sat": total_wallet_balance_sat},
+        labels={"wallet_count": len(wallet_rows), "total_balance_sat": total_wallet_balance_sat},
     )
 
 

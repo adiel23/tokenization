@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision = '0012_add_wallet_onchain'
-down_revision = '0011_normalize_late_check_constraint_names'
+revision = '0012'
+down_revision = '0011'
 branch_labels = None
 depends_on = None
 

@@ -60,6 +60,28 @@ services:
     networks:
       - platform
 
+  auth:
+    image: python:3.11-slim
+    container_name: tokenization-auth
+    restart: unless-stopped
+    working_dir: /app/services/auth
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
+      uvicorn main:app --host 0.0.0.0 --port 8000"
+    env_file:
+      - ./.env.local
+    volumes:
+      - ../:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8007:8000"
+    networks:
+      - platform
+
   tokenization:
     image: python:3.11-slim
     container_name: tokenization-tokenization
@@ -148,6 +170,28 @@ services:
     networks:
       - platform
 
+  admin:
+    image: python:3.11-slim
+    container_name: tokenization-admin
+    restart: unless-stopped
+    working_dir: /app/services/admin
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
+      uvicorn main:app --host 0.0.0.0 --port 8006"
+    env_file:
+      - ./.env.local
+    volumes:
+      - ../:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8006:8006"
+    networks:
+      - platform
+
   bitcoind:
     image: lncm/bitcoind:v28.0
     container_name: tokenization-bitcoind
@@ -177,11 +221,13 @@ services:
     container_name: tokenization-gateway
     restart: unless-stopped
     depends_on:
+      - auth
       - wallet
       - tokenization
       - marketplace
       - education
       - nostr
+      - admin
     ports:
       - "8000:8000"
     networks:

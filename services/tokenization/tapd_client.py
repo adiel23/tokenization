@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 
 import grpc
 
-from .tapd_grpc import taprootassets as tap
-from .tapd_grpc import taprootassetsgrpc as taprpc
+from tokenization.tapd_grpc import taprootassets as tap
+from tokenization.tapd_grpc import taprootassetsgrpc as taprpc
 
 if TYPE_CHECKING:
     from services.common.config import Settings
