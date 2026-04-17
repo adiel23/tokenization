@@ -73,6 +73,19 @@ The local stack includes a pre-configured Bitcoin Core node running in `regtest`
 
 The local profile template in `infra/.env.local.example` is aligned with these same regtest credentials.
 
+## Marketplace escrow runtime
+
+The marketplace service now includes an internal escrow watcher that:
+
+- scans `created` escrows for Liquid funding on a schedule,
+- prepares the seller-release PSET after funding is detected,
+- expires unfunded escrows and restores seller inventory when `expires_at` passes.
+
+Relevant local env knobs:
+
+- `MARKETPLACE_ESCROW_WATCH_INTERVAL_SECONDS`
+- `MARKETPLACE_ESCROW_FEE_RESERVE_SAT`
+
 ## LND (regtest)
 
 The compose profile includes an `lnd` service wired to the local `bitcoind` over JSON-RPC and ZMQ. For local development it uses `noseedbackup`, so the node self-initializes on first boot and persists its state in the `lnd_data` Docker volume.

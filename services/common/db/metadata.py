@@ -301,7 +301,7 @@ trades = sa.Table(
     sa.Index("ix_trades_token_id", "token_id"),
     sa.Index("ix_trades_status", "status"),
     sa.CheckConstraint(
-        "status IN ('pending', 'escrowed', 'settled', 'disputed')",
+        "status IN ('pending', 'escrowed', 'settled', 'disputed', 'cancelled')",
         name="status_allowed",
     ),
 )
@@ -318,6 +318,7 @@ escrows = sa.Table(
     sa.Column("locked_amount_sat", sa.BigInteger(), nullable=False),
     sa.Column("funding_txid", sa.String(length=64), nullable=True),
     sa.Column("release_txid", sa.String(length=64), nullable=True),
+    sa.Column("refund_txid", sa.String(length=64), nullable=True),
     sa.Column("collected_signatures", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column("settlement_metadata", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column("status", sa.String(length=20), nullable=False, server_default="created"),
@@ -328,7 +329,7 @@ escrows = sa.Table(
     sa.UniqueConstraint("trade_id", name="uq_escrows_trade_id"),
     sa.Index("ix_escrows_status", "status"),
     sa.CheckConstraint(
-        "status IN ('created', 'funded', 'released', 'refunded', 'disputed')",
+        "status IN ('created', 'funded', 'inspection_pending', 'released', 'refunded', 'disputed', 'expired')",
         name="status_allowed",
     ),
 )

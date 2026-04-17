@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     # KYC: trade value threshold (sats) above which KYC verification is required.
     # Set to 0 to disable enforcement.  Default 10 000 000 sats (~0.1 BTC).
     kyc_trade_threshold_sat: int = 10_000_000
+    marketplace_escrow_watch_interval_seconds: int = 30
+    marketplace_escrow_fee_reserve_sat: int = 5_000
 
     @property
     def nostr_relay_list(self) -> list[str]:
